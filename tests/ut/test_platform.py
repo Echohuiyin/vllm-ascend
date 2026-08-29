@@ -1,10 +1,12 @@
 import importlib
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.platforms import PlatformEnum
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.attention.selector import AttentionSelectorConfig  # type: ignore
 
 from tests.ut.base import TestBase
@@ -61,6 +63,156 @@ class TestNPUPlatform(TestBase):
 
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
+
+    def test_register_allocator_cli_args(self):
+        parser = FlexibleArgumentParser()
+        self.platform._register_allocator_cli_args(parser)
+        self.platform._register_allocator_cli_args(parser)
+
+        args = parser.parse_args(["--multiproc-pipe"])
+
+        self.assertTrue(args.multiproc_pipe)
+
+        disabled_args = parser.parse_args(["--no-multiproc-pipe"])
+        self.assertFalse(disabled_args.multiproc_pipe)
+
+    def test_postprocess_multiproc_pipe_cli_args(self):
+        args = SimpleNamespace(additional_config={"other": True}, multiproc_pipe=True)
+
+        self.platform.postprocess_cli_args(args)
+
+        self.assertEqual(args.additional_config, {"other": True, "multiproc_pipe": True})
+
+    @staticmethod
+    def _valid_multiproc_pipe_config():
+        return SimpleNamespace(
+            additional_config={"multiproc_pipe": True},
+            speculative_config=None,
+            lora_config=None,
+            model_config=SimpleNamespace(
+                enable_sleep_mode=True,
+                enforce_eager=True,
+                architectures=["Qwen2ForCausalLM"],
+            ),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+                nnodes=1,
+                distributed_executor_backend="mp",
+                worker_cls="auto",
+            ),
+        )
+
+    @patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False)
+    def test_validate_multiproc_pipe_accepts_supported_eager_model(self):
+        ascend_config = SimpleNamespace(xlite_graph_config=SimpleNamespace(enabled=False))
+
+        for tensor_parallel_size in (1, 2, 4, 8):
+            with self.subTest(tensor_parallel_size=tensor_parallel_size):
+                vllm_config = self._valid_multiproc_pipe_config()
+                vllm_config.parallel_config.tensor_parallel_size = tensor_parallel_size
+                self.platform._validate_multiproc_pipe_config(vllm_config, ascend_config)
+
+        vllm_config = self._valid_multiproc_pipe_config()
+        vllm_config.model_config.enforce_eager = False
+        with self.assertRaisesRegex(ValueError, "requires --enforce-eager"):
+            self.platform._validate_multiproc_pipe_config(vllm_config, ascend_config)
+
+    @patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False)
+    def test_validate_multiproc_pipe_rejects_unsupported_modes(self):
+        cases = [
+            (
+                "sleep disabled",
+                lambda config, ascend: setattr(config.model_config, "enable_sleep_mode", False),
+                "enable-sleep-mode",
+            ),
+            (
+                "non-eager",
+                lambda config, ascend: setattr(config.model_config, "enforce_eager", False),
+                "enforce-eager",
+            ),
+            (
+                "unsupported model",
+                lambda config, ascend: setattr(config.model_config, "architectures", ["LlamaForCausalLM"]),
+                "currently supports",
+            ),
+            (
+                "speculative decoding",
+                lambda config, ascend: setattr(config, "speculative_config", SimpleNamespace()),
+                "speculative decoding",
+            ),
+            (
+                "LoRA",
+                lambda config, ascend: setattr(config, "lora_config", SimpleNamespace()),
+                "LoRA",
+            ),
+            (
+                "tensor parallel",
+                lambda config, ascend: setattr(config.parallel_config, "tensor_parallel_size", 3),
+                "tensor_parallel_size 1, 2, 4, or 8",
+            ),
+            (
+                "pipeline parallel",
+                lambda config, ascend: setattr(config.parallel_config, "pipeline_parallel_size", 2),
+                "pipeline or data parallelism",
+            ),
+            (
+                "data parallel",
+                lambda config, ascend: setattr(config.parallel_config, "data_parallel_size", 2),
+                "pipeline or data parallelism",
+            ),
+            (
+                "prefill context parallel",
+                lambda config, ascend: setattr(config.parallel_config, "prefill_context_parallel_size", 2),
+                "prefill context parallelism",
+            ),
+            (
+                "decode context parallel",
+                lambda config, ascend: setattr(config.parallel_config, "decode_context_parallel_size", 2),
+                "decode context parallelism",
+            ),
+            (
+                "multi-node",
+                lambda config, ascend: setattr(config.parallel_config, "nnodes", 2),
+                "single-node",
+            ),
+            (
+                "ray executor",
+                lambda config, ascend: setattr(config.parallel_config, "distributed_executor_backend", "ray"),
+                "local uniprocess or multiprocessing",
+            ),
+            (
+                "custom worker",
+                lambda config, ascend: setattr(config.parallel_config, "worker_cls", "custom.Worker"),
+                "standard vllm-ascend NPUWorker",
+            ),
+            (
+                "xlite",
+                lambda config, ascend: setattr(ascend.xlite_graph_config, "enabled", True),
+                "Xlite worker",
+            ),
+        ]
+
+        for name, mutate, expected in cases:
+            with self.subTest(name=name):
+                config = self._valid_multiproc_pipe_config()
+                ascend_config = SimpleNamespace(xlite_graph_config=SimpleNamespace(enabled=False))
+                mutate(config, ascend_config)
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.platform._validate_multiproc_pipe_config(config, ascend_config)
+
+    def test_validate_multiproc_pipe_rejects_v2_runner(self):
+        config = self._valid_multiproc_pipe_config()
+        ascend_config = SimpleNamespace(xlite_graph_config=SimpleNamespace(enabled=False))
+
+        with (
+            patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", True),
+            self.assertRaisesRegex(ValueError, "v2 model runner"),
+        ):
+            self.platform._validate_multiproc_pipe_config(config, ascend_config)
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")

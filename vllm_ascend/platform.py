@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import argparse
 import math
 import os
 from typing import TYPE_CHECKING, Any
@@ -131,6 +132,16 @@ class NPUPlatform(Platform):
         return "vllm_ascend.compilation.compiler_interface.AscendCompiler"
 
     @classmethod
+    def _register_allocator_cli_args(cls, parser: FlexibleArgumentParser) -> None:
+        if "--multiproc-pipe" not in parser._option_string_actions:
+            parser.add_argument(
+                "--multiproc-pipe",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help=("Enable multi-process layer-wise weight restoration with a dedicated Copier process."),
+            )
+
+    @classmethod
     def pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None:
         # Adapt the global patch here.
         from vllm_ascend.utils import adapt_patch
@@ -145,6 +156,7 @@ class NPUPlatform(Platform):
             if quant_action and hasattr(quant_action, "choices") and quant_action.choices:
                 if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
                     quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
+            cls._register_allocator_cli_args(parser)
 
         if not is_310p():
             from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendModelSlimConfig  # noqa: F401
@@ -152,6 +164,15 @@ class NPUPlatform(Platform):
             from vllm_ascend._310p.quantization import AscendModelSlimConfig310  # noqa: F401
 
         config_deprecated_logging()
+
+    @classmethod
+    def postprocess_cli_args(cls, args: Any) -> None:
+        from vllm_ascend.device_allocator.multiproc_pipe_config import merge_multiproc_pipe_cli_config
+
+        args.additional_config = merge_multiproc_pipe_cli_config(
+            getattr(args, "additional_config", None),
+            enabled=getattr(args, "multiproc_pipe", None),
+        )
 
     @classmethod
     def _get_default_max_cudagraph_capture_size(cls, vllm_config: VllmConfig) -> int | None:
@@ -248,6 +269,56 @@ class NPUPlatform(Platform):
             )
 
     @classmethod
+    def _validate_multiproc_pipe_config(cls, vllm_config: VllmConfig, ascend_config: Any) -> None:
+        from vllm_ascend.device_allocator.multiproc_pipe_config import (
+            SUPPORTED_MULTIPROC_PIPE_TP_SIZES,
+            is_multiproc_pipe_enabled,
+        )
+
+        if not is_multiproc_pipe_enabled(vllm_config):
+            return
+        if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+            raise ValueError("multiproc_pipe does not support the experimental v2 model runner.")
+        model_config = vllm_config.model_config
+        if model_config is None or not model_config.enable_sleep_mode:
+            raise ValueError("multiproc_pipe requires --enable-sleep-mode.")
+        if not model_config.enforce_eager:
+            raise ValueError("multiproc_pipe currently requires --enforce-eager.")
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            raise ValueError("multiproc_pipe does not support speculative decoding.")
+        if getattr(vllm_config, "lora_config", None) is not None:
+            raise ValueError("multiproc_pipe does not support LoRA.")
+        supported_architectures = {
+            "Qwen2ForCausalLM",
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+        }
+        architectures = getattr(model_config, "architectures", None) or ()
+        if not set(architectures).intersection(supported_architectures):
+            raise ValueError(
+                "multiproc_pipe currently supports Qwen2ForCausalLM, DeepseekV2ForCausalLM, and DeepseekV3ForCausalLM."
+            )
+        parallel_config = vllm_config.parallel_config
+        if parallel_config is None:
+            raise ValueError("multiproc_pipe requires a parallel configuration.")
+        if parallel_config.tensor_parallel_size not in SUPPORTED_MULTIPROC_PIPE_TP_SIZES:
+            raise ValueError("multiproc_pipe supports tensor_parallel_size 1, 2, 4, or 8 only.")
+        if parallel_config.pipeline_parallel_size != 1 or parallel_config.data_parallel_size != 1:
+            raise ValueError("multiproc_pipe does not support pipeline or data parallelism.")
+        if getattr(parallel_config, "prefill_context_parallel_size", 1) != 1:
+            raise ValueError("multiproc_pipe does not support prefill context parallelism.")
+        if getattr(parallel_config, "decode_context_parallel_size", 1) != 1:
+            raise ValueError("multiproc_pipe does not support decode context parallelism.")
+        if parallel_config.nnodes != 1:
+            raise ValueError("multiproc_pipe supports single-node workers only.")
+        if parallel_config.distributed_executor_backend not in (None, "mp", "uni"):
+            raise ValueError("multiproc_pipe supports only local uniprocess or multiprocessing executors.")
+        if parallel_config.worker_cls not in ("auto", "vllm_ascend.worker.worker.NPUWorker"):
+            raise ValueError("multiproc_pipe requires the standard vllm-ascend NPUWorker.")
+        if ascend_config.xlite_graph_config.enabled:
+            raise ValueError("multiproc_pipe is not compatible with the Xlite worker.")
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
@@ -260,6 +331,7 @@ class NPUPlatform(Platform):
         cls._fix_incompatible_config(vllm_config)
 
         ascend_config = init_ascend_config(vllm_config)
+        cls._validate_multiproc_pipe_config(vllm_config, ascend_config)
 
         if vllm_config.kv_transfer_config is not None:
             check_kv_extra_config(vllm_config)

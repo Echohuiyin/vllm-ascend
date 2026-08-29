@@ -105,6 +105,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Platform validation: only PD-mixed mode (`kv_role='kv_both'` or no kv_transfer_config).
     # Not supported in PD-disaggregated mode (`kv_producer` / `kv_consumer` only).
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
+    # Timeout for Copier startup, control barriers, and per-layer readiness.
+    "VLLM_ASCEND_MULTIPROC_PIPE_TIMEOUT": lambda: float(os.getenv("VLLM_ASCEND_MULTIPROC_PIPE_TIMEOUT", "600")),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))

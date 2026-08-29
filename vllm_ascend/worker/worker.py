@@ -30,7 +30,12 @@ from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
 from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
@@ -51,6 +56,10 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
+from vllm_ascend.device_allocator.multiproc_pipe_config import (
+    is_multiproc_pipe_enabled,
+)
+from vllm_ascend.device_allocator.selector import create_sleep_mode_allocator
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (
@@ -127,6 +136,31 @@ class NPUWorker(WorkerBase):
         if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
             # Buffers saved before sleep
             self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._sleep_mode_allocator: CaMemAllocator | None = None
+        self.layer_ready_events = None
+        if is_multiproc_pipe_enabled(vllm_config):
+            from vllm.utils.system_utils import get_mp_context
+
+            context = get_mp_context()
+            num_layers = self.model_config.get_num_layers(self.parallel_config)
+            events = kwargs.pop("layer_ready_events", None)
+            if events is None:
+                events = {index: context.Event() for index in range(num_layers)}
+            if sorted(events) != list(range(num_layers)):
+                raise ValueError("multiproc_pipe layer events do not match the model")
+            queue_names = ("desc_queue", "npu_recover_queue", "ctrl_queue")
+            queues = tuple(kwargs.pop(name, None) for name in queue_names)
+            if any(queue is not None for queue in queues):
+                if any(queue is None for queue in queues):
+                    raise ValueError("multiproc_pipe requires desc, recovery, and control queues")
+            else:
+                queues = tuple(context.Queue() for _ in queue_names)
+            self.layer_ready_events = events
+            CaMemAllocator.set_pipeline_switch(True)
+            CaMemAllocator.set_desc_queue(queues[0])
+            CaMemAllocator.set_npu_recover_queue(queues[1])
+            CaMemAllocator.set_ctrl_queue(queues[2])
+            CaMemAllocator.set_layer_ready_events(events)
 
         # FixMe: this is a patch to fix the issue cause by https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170
         from vllm.model_executor.layers.linear import WEIGHT_LOADER_V2_SUPPORTED
@@ -193,7 +227,7 @@ class NPUWorker(WorkerBase):
         if level == 2:
             model = self.model_runner.model
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
-        allocator = CaMemAllocator.get_instance()
+        allocator = self._get_sleep_mode_allocator()
         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
         free_bytes_after_sleep, total = torch.npu.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
@@ -211,9 +245,20 @@ class NPUWorker(WorkerBase):
                 "FRACTAL_NZ mode is enabled. This may cause model parameter precision issues "
                 "in the RL scenarios. Please set VLLM_ASCEND_ENABLE_NZ=0."
             )
-        allocator = CaMemAllocator.get_instance()
+        allocator = self._get_sleep_mode_allocator()
         allocator.wake_up(tags=tags)
+        if not allocator.multiproc_pipe_enabled:
+            self._restore_moe_weight_layout(tags)
 
+        # Restore the buffers after level 2 sleep
+        model = self.model_runner.model
+        if len(self._sleep_saved_buffers):
+            for name, buffer in model.named_buffers():
+                if name in self._sleep_saved_buffers:
+                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
+            self._sleep_saved_buffers = {}
+
+    def _restore_moe_weight_layout(self, tags: list[str] | None) -> None:
         hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
         model = self.model_runner.model
         if tags is None or "weights" in tags:
@@ -235,12 +280,30 @@ class NPUWorker(WorkerBase):
                     w13_data = torch.nn.Parameter(w13_data, requires_grad=False)
                     setattr(parent_module, param_name, w13_data)
 
-        # Restore the buffers after level 2 sleep
-        if len(self._sleep_saved_buffers):
-            for name, buffer in model.named_buffers():
-                if name in self._sleep_saved_buffers:
-                    buffer.data.copy_(self._sleep_saved_buffers[name].data)
-            self._sleep_saved_buffers = {}
+    def suspend(self, level: int = 1) -> None:
+        """Release memory for the multiprocess layer-wise restore path."""
+        if not is_multiproc_pipe_enabled(self.vllm_config):
+            logger.warning("multiproc_pipe is disabled; ignoring suspend request")
+            return
+        if level != 1:
+            raise ValueError("multiproc_pipe suspend supports only level 1")
+        free_bytes_before = torch.npu.mem_get_info()[0]
+        allocator = self._get_sleep_mode_allocator()
+        allocator.suspend(offload_tags=("weights",))
+        free_bytes_after, total = torch.npu.mem_get_info()
+        logger.info(
+            "multiproc_pipe suspend freed %.2f GiB; %.2f GiB remains in use",
+            (free_bytes_after - free_bytes_before) / GiB_bytes,
+            (total - free_bytes_after) / GiB_bytes,
+        )
+
+    def resume(self, tags: list[str] | None = None) -> None:
+        """Start Copier restoration and return once layer zero is ready."""
+        if not is_multiproc_pipe_enabled(self.vllm_config):
+            logger.warning("multiproc_pipe is disabled; ignoring resume request")
+            return
+        allocator = self._get_sleep_mode_allocator()
+        allocator.resume(tags)
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
@@ -427,10 +490,25 @@ class NPUWorker(WorkerBase):
         return self.model_runner.sample_tokens(grammar_output)
 
     def load_model(self) -> None:
+        allocator: CaMemAllocator | None = None
         if self.vllm_config.model_config.enable_sleep_mode:
-            allocator = CaMemAllocator.get_instance()
+            allocator = self._get_sleep_mode_allocator()
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
-            context = allocator.use_memory_pool(tag="weights")
+            if allocator.multiproc_pipe_enabled:
+                device_index = getattr(self.device, "index", self.device)
+                if device_index is None:
+                    raise RuntimeError("multiproc_pipe requires an explicit NPU device index")
+                allocator.start_pipeline(
+                    int(device_index),
+                    self.model_config.get_num_layers(self.parallel_config),
+                    self.layer_ready_events,
+                    tp_size=self.parallel_config.tensor_parallel_size,
+                    local_rank=self.local_rank,
+                )
+            if allocator.multiproc_pipe_enabled:
+                context = allocator.use_memory_pool_share(tag="weights")
+            else:
+                context = allocator.use_memory_pool(tag="weights")
         else:
             from contextlib import nullcontext
 
@@ -438,6 +516,13 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+        if (
+            self.vllm_config.model_config.enable_sleep_mode
+            and allocator is not None
+            and allocator.multiproc_pipe_enabled
+        ):
+            allocator.send_descs_for_scattered_weights()
+            allocator.wait_for_copier_ready()
 
     def compile_or_warm_up_model(self) -> float:
         # Note: need to adapt for graph mode.
@@ -513,9 +598,9 @@ class NPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
+        allocator = self._get_sleep_mode_allocator() if self.vllm_config.model_config.enable_sleep_mode else None
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
-        if self.vllm_config.model_config.enable_sleep_mode:
-            allocator = CaMemAllocator.get_instance()
+        if allocator is not None:
             context = allocator.use_memory_pool(tag="kv_cache")
         else:
             from contextlib import nullcontext
@@ -523,6 +608,44 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def _get_sleep_mode_allocator(self) -> CaMemAllocator:
+        allocator = getattr(self, "_sleep_mode_allocator", None)
+        if allocator is not None:
+            return allocator
+        allocator = create_sleep_mode_allocator(self.vllm_config, self.device)
+        self._sleep_mode_allocator = allocator
+        return allocator
+
+    def shutdown(self) -> None:
+        allocator = getattr(self, "_sleep_mode_allocator", None)
+        first_error: Exception | None = None
+        if ensure_kv_transfer_shutdown is not None:
+            try:
+                ensure_kv_transfer_shutdown()
+            except Exception as error:
+                first_error = error
+        profiler = getattr(self, "profiler", None)
+        if profiler is not None:
+            try:
+                profiler.shutdown()
+            except Exception as error:
+                first_error = first_error or error
+        weight_transfer_engine = getattr(self, "weight_transfer_engine", None)
+        if weight_transfer_engine is not None:
+            try:
+                weight_transfer_engine.shutdown()
+            except Exception as error:
+                first_error = first_error or error
+        if allocator is not None:
+            close = getattr(allocator, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as error:
+                    first_error = first_error or error
+        if first_error is not None:
+            raise first_error
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled (RFC #6954 - align with upstream vLLM)

@@ -7,6 +7,7 @@ from collections import deque
 from collections.abc import Callable
 from multiprocessing.synchronize import Lock as LockType
 from threading import Thread
+from typing import Any
 
 import vllm.v1.executor.multiproc_executor
 from vllm import envs
@@ -26,6 +27,10 @@ from vllm.v1.executor.multiproc_executor import (
     set_multiprocessing_worker_envs,
 )
 from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+from vllm_ascend.device_allocator.multiproc_pipe_config import (
+    is_multiproc_pipe_enabled,
+)
 
 
 class AscendMultiprocExecutor(MultiprocExecutor):
@@ -69,6 +74,12 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
+        layer_ready_events = None
+        if is_multiproc_pipe_enabled(self.vllm_config):
+            num_layers = self.vllm_config.model_config.get_num_layers(self.parallel_config)
+            layer_ready_events = [
+                {index: context.Event() for index in range(num_layers)} for _ in range(self.local_world_size)
+            ]
         unready_workers: list[UnreadyWorkerProcHandle] = []
         success = False
         try:
@@ -91,6 +102,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                     shared_worker_lock=shared_worker_lock,
                     is_driver_worker=is_driver_worker,
                     inherited_fds=inherited_fds,
+                    layer_ready_events=(layer_ready_events[local_rank] if layer_ready_events is not None else None),
                 )
                 unready_workers.append(unready_worker_handle)
                 if inherited_fds is not None:
@@ -176,6 +188,7 @@ class AscendWorkerProc(WorkerProc):
         input_shm_handle: Handle,
         shared_worker_lock: LockType,
         is_driver_worker: bool,
+        layer_ready_events: dict[int, Any] | None = None,
     ):
         self.rank = rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
@@ -189,6 +202,8 @@ class AscendWorkerProc(WorkerProc):
             "is_driver_worker": is_driver_worker,
             "shared_worker_lock": shared_worker_lock,
         }
+        if layer_ready_events is not None:
+            all_kwargs[local_rank]["layer_ready_events"] = layer_ready_events
         wrapper.init_worker(all_kwargs)
         self.worker = wrapper
 
@@ -249,6 +264,7 @@ class AscendWorkerProc(WorkerProc):
         shared_worker_lock: LockType,
         is_driver_worker: bool = False,
         inherited_fds: list[int] | None = None,
+        layer_ready_events: dict[int, Any] | None = None,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
         # Ready pipe to communicate readiness from child to parent
@@ -268,6 +284,7 @@ class AscendWorkerProc(WorkerProc):
             "death_pipe": death_reader,
             "shared_worker_lock": shared_worker_lock,
             "is_driver_worker": is_driver_worker,
+            "layer_ready_events": layer_ready_events,
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
@@ -275,6 +292,7 @@ class AscendWorkerProc(WorkerProc):
         daemon_mode = not (
             os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
             or os.getenv("EXPERT_MAP_RECORD", "false") == "true"
+            or is_multiproc_pipe_enabled(vllm_config)
         )
         proc = context.Process(
             target=AscendWorkerProc.worker_main,

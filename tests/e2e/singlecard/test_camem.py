@@ -27,6 +27,8 @@ from vllm.utils.mem_constants import GiB_bytes
 from tests.e2e.conftest import VllmRunner
 from tests.e2e.utils import fork_new_process_for_each_test
 
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 
 @fork_new_process_for_each_test
 @patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "0"})
@@ -55,3 +57,24 @@ def test_end_to_end():
 
     # cmp output
     assert output[0].outputs[0].text == output2[0].outputs[0].text
+
+
+@fork_new_process_for_each_test
+@patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_NZ": "0"})
+def test_camem_copier_suspend_resume_e2e():
+    prompts = ["Explain virtual memory in one sentence."]
+
+    with VllmRunner(
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        enable_sleep_mode=True,
+        enforce_eager=True,
+        max_model_len=512,
+        additional_config={"multiproc_pipe": True},
+    ) as runner:
+        baseline = runner.generate_greedy(prompts, max_tokens=8)
+        runner.model.suspend()
+        runner.model.resume()
+        restored = runner.generate_greedy(prompts, max_tokens=8)
+        runner.model.suspend()
+
+    assert restored == baseline
