@@ -105,6 +105,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Platform validation: only PD-mixed mode (`kv_role='kv_both'` or no kv_transfer_config).
     # Not supported in PD-disaggregated mode (`kv_producer` / `kv_consumer` only).
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
+    # Directory shared by vLLM workers and external Famem HBM servers.
+    # Each server publishes one Unix socket named after the physical NPU UUID.
+    "VLLM_ASCEND_FAMEM_SOCKET_DIR": lambda: os.getenv("VLLM_ASCEND_FAMEM_SOCKET_DIR", "/run/vllm-ascend/famem"),
     # Timeout for Copier startup, control barriers, and per-layer readiness.
     "VLLM_ASCEND_MULTIPROC_PIPE_TIMEOUT": lambda: float(os.getenv("VLLM_ASCEND_MULTIPROC_PIPE_TIMEOUT", "600")),
     # use fused op transpose_kv_cache_by_block, default is True

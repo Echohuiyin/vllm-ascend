@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import queue
+import threading
 import weakref
 from collections import deque
 from collections.abc import Callable
@@ -17,8 +18,7 @@ from vllm.envs import enable_envs_cache
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
 from vllm.utils.network_utils import get_distributed_init_method, get_loopback_ip, get_open_port
-from vllm.utils.system_utils import get_mp_context
-from vllm.v1.executor.abstract import FailureCallback
+from vllm.utils.system_utils import arm_parent_death_signal, get_mp_context
 from vllm.v1.executor.multiproc_executor import (
     FutureWrapper,
     MultiprocExecutor,
@@ -28,8 +28,14 @@ from vllm.v1.executor.multiproc_executor import (
 )
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.device_allocator.multiproc_pipe_config import (
     is_multiproc_pipe_enabled,
+)
+
+_LIFECYCLE_RPC_METHODS = frozenset({"sleep", "wake_up", "suspend", "resume"})
+_WEIGHT_MUTATION_RPC_METHODS = frozenset(
+    {"add_lora", "apply_model", "load_model", "reload_weights", "remove_lora", "update_weights"}
 )
 
 
@@ -38,8 +44,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         # Call self.shutdown at exit to clean up
         # and ensure workers will be terminated.
         self._finalizer = weakref.finalize(self, self.shutdown)
-        self.is_failed = False
-        self.failure_callback: FailureCallback | None = None
+        self._init_failure_state()
 
         tensor_parallel_size, pp_parallel_size, pcp_parallel_size = self._get_parallel_sizes()
         assert self.world_size == tensor_parallel_size * pp_parallel_size * pcp_parallel_size, (
@@ -176,6 +181,35 @@ class AscendMultiprocExecutor(MultiprocExecutor):
     def _is_driver_worker(self, rank: int) -> bool:
         return rank % self.parallel_config.tensor_parallel_size == 0
 
+    def collective_rpc(  # type: ignore[override]
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        non_block: bool = False,
+        unique_reply_rank: int | None = None,
+        kv_output_aggregator: Any | None = None,
+    ) -> Any:
+        pipe_enabled = is_multiproc_pipe_enabled(self.vllm_config)
+        if pipe_enabled and (not isinstance(method, str) or method in _WEIGHT_MUTATION_RPC_METHODS):
+            raise ValueError("multiproc_pipe rejects runtime model mutation after the Copier captures its weight image")
+        # A live Worker can block indefinitely inside CANN, so neither the
+        # death pipe nor PDEATHSIG detects this failure. Bound only the
+        # multiproc-pipe lifecycle RPCs; upstream fail-stop then terminates
+        # the Worker/Copier group and lets the Famem server reclaim its lease.
+        if timeout is None and isinstance(method, str) and method in _LIFECYCLE_RPC_METHODS and pipe_enabled:
+            timeout = ascend_envs.VLLM_ASCEND_MULTIPROC_PIPE_TIMEOUT
+        return super().collective_rpc(
+            method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            non_block=non_block,
+            unique_reply_rank=unique_reply_rank,
+            kv_output_aggregator=kv_output_aggregator,
+        )
+
 
 class AscendWorkerProc(WorkerProc):
     @instrument(span_name="Worker init")
@@ -240,7 +274,13 @@ class AscendWorkerProc(WorkerProc):
         enable_envs_cache()
 
     @staticmethod
-    def worker_main(*args, **kwargs):
+    def worker_main(*args, expected_parent_pid: int | None = None, **kwargs):
+        # Arm the kernel-enforced guard before adapt_patch or WorkerProc can
+        # initialize CANN/NPU. The death pipe below remains responsible for
+        # graceful queue cleanup when the Worker is still schedulable.
+        if expected_parent_pid is not None:
+            arm_parent_death_signal(expected_parent_pid, process_name="Ascend Worker")
+
         from vllm_ascend.utils import adapt_patch
 
         adapt_patch(is_global_patch=True)
@@ -266,6 +306,13 @@ class AscendWorkerProc(WorkerProc):
         inherited_fds: list[int] | None = None,
         layer_ready_events: dict[int, Any] | None = None,
     ) -> UnreadyWorkerProcHandle:
+        multiproc_pipe_enabled = is_multiproc_pipe_enabled(vllm_config)
+        if multiproc_pipe_enabled and threading.current_thread() is not threading.main_thread():
+            # Linux associates PDEATHSIG with the thread that creates the
+            # child. Requiring EngineCore's main thread prevents a healthy
+            # Worker from being killed merely because a launcher thread exits.
+            raise RuntimeError("multiproc_pipe Workers must be started from the EngineCore main thread")
+
         context = get_mp_context()
         # Ready pipe to communicate readiness from child to parent
         ready_reader, ready_writer = context.Pipe(duplex=False)
@@ -289,10 +336,15 @@ class AscendWorkerProc(WorkerProc):
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
         # Run EngineCore busy loop in background process.
+        if multiproc_pipe_enabled:
+            # The Worker must fail with its creating EngineCore even if it is
+            # blocked inside CANN and cannot service the death-pipe thread.
+            process_kwargs["expected_parent_pid"] = os.getpid()
+
         daemon_mode = not (
             os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
             or os.getenv("EXPERT_MAP_RECORD", "false") == "true"
-            or is_multiproc_pipe_enabled(vllm_config)
+            or multiproc_pipe_enabled
         )
         proc = context.Process(
             target=AscendWorkerProc.worker_main,

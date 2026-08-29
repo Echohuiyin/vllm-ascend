@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -33,6 +34,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.device_allocator.famem_config import get_famem_config
 
 # isort: off
 from vllm_ascend.utils import (
@@ -54,6 +56,8 @@ from vllm_ascend.utils import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
     from vllm.utils import FlexibleArgumentParser
+    from vllm.v1.executor.abstract import Executor
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 else:
     ModelConfig = None
     VllmConfig = None
@@ -140,6 +144,21 @@ class NPUPlatform(Platform):
                 default=None,
                 help=("Enable multi-process layer-wise weight restoration with a dedicated Copier process."),
             )
+        if "--use-famem-allocator" not in parser._option_string_actions:
+            parser.add_argument(
+                "--use-famem-allocator",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="Use the external Famem HBM allocator for weights and KV cache.",
+            )
+        if "--use-famem-allocator-size" not in parser._option_string_actions:
+            parser.add_argument(
+                "--use-famem-allocator-size",
+                type=int,
+                default=None,
+                metavar="GIB",
+                help="Famem arena size per NPU, in integer GiB.",
+            )
 
     @classmethod
     def pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None:
@@ -167,12 +186,134 @@ class NPUPlatform(Platform):
 
     @classmethod
     def postprocess_cli_args(cls, args: Any) -> None:
+        from vllm_ascend.device_allocator.famem_config import merge_famem_cli_config
         from vllm_ascend.device_allocator.multiproc_pipe_config import merge_multiproc_pipe_cli_config
 
         args.additional_config = merge_multiproc_pipe_cli_config(
             getattr(args, "additional_config", None),
             enabled=getattr(args, "multiproc_pipe", None),
         )
+        args.additional_config = merge_famem_cli_config(
+            args.additional_config,
+            enabled=getattr(args, "use_famem_allocator", None),
+            size_gib=getattr(args, "use_famem_allocator_size", None),
+        )
+
+    @classmethod
+    def adjust_kv_cache_configs(
+        cls,
+        vllm_config: VllmConfig,
+        model_executor: Executor,
+        kv_cache_configs: list[KVCacheConfig],
+    ) -> list[KVCacheConfig]:
+        from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
+
+        from vllm_ascend.device_allocator.kv_cache_plan import resize_kv_cache_config, validate_fit_response
+
+        if not get_famem_config(vllm_config).enabled or not kv_cache_configs:
+            return kv_cache_configs
+
+        responses = model_executor.collective_rpc("get_famem_kv_cache_block_fit", args=(kv_cache_configs,))
+        if len(responses) != len(kv_cache_configs):
+            raise RuntimeError(
+                "Famem KV cache calibration returned a different number of worker results and configurations."
+            )
+        fits = [validate_fit_response(response) for response in responses]
+        current_num_blocks = kv_cache_configs[0].num_blocks
+        if any(config.num_blocks != current_num_blocks for config in kv_cache_configs):
+            raise RuntimeError("Famem received inconsistent KV cache block counts across workers.")
+        if any(fit.num_blocks > current_num_blocks for fit in fits):
+            raise RuntimeError("Famem KV cache calibration attempted to increase the generated block count.")
+
+        target_num_blocks = min(fit.num_blocks for fit in fits)
+        if target_num_blocks <= 0:
+            limiting_fit = min(fits, key=lambda fit: fit.available_bytes)
+            raise MemoryError(
+                "Famem cannot fit one KV cache block after physical allocation overhead: "
+                f"available={limiting_fit.available_bytes} bytes. Increase the arena size or reduce model memory."
+            )
+
+        logger.info(
+            "Famem KV cache calibration selected %d/%d blocks; per-rank reserved/available bytes: %s",
+            target_num_blocks,
+            current_num_blocks,
+            [(fit.native_bytes, fit.available_bytes) for fit in fits],
+        )
+
+        if target_num_blocks == current_num_blocks:
+            return kv_cache_configs
+
+        for config in kv_cache_configs:
+            resize_kv_cache_config(config, target_num_blocks)
+
+        def supports_model_len(model_len: int) -> bool:
+            previous_model_len = vllm_config.model_config.max_model_len
+            vllm_config.model_config.max_model_len = model_len
+            try:
+                return all(
+                    not config.kv_cache_groups or get_max_concurrency_for_kv_cache_config(vllm_config, config) >= 1
+                    for config in kv_cache_configs
+                )
+            finally:
+                vllm_config.model_config.max_model_len = previous_model_len
+
+        configured_max_model_len = vllm_config.model_config.max_model_len
+        if not supports_model_len(configured_max_model_len):
+            low, high = 1, configured_max_model_len
+            estimated_max_model_len = 0
+            while low <= high:
+                candidate = (low + high) // 2
+                if supports_model_len(candidate):
+                    estimated_max_model_len = candidate
+                    low = candidate + 1
+                else:
+                    high = candidate - 1
+
+            if vllm_config.model_config.original_max_model_len == -1 and estimated_max_model_len > 0:
+                vllm_config.model_config.max_model_len = estimated_max_model_len
+                logger.info(
+                    "Famem physical KV allocation reduced auto-fitted max_model_len from %d to %d.",
+                    configured_max_model_len,
+                    estimated_max_model_len,
+                )
+            else:
+                estimate = (
+                    f" The estimated maximum model length is {estimated_max_model_len}."
+                    if estimated_max_model_len > 0
+                    else ""
+                )
+                raise ValueError(
+                    "Famem physical KV allocation overhead leaves too few cache blocks for "
+                    f"max_model_len={configured_max_model_len}.{estimate} Increase the "
+                    "arena size or reduce max_model_len."
+                )
+
+        logger.info(
+            "Reduced KV cache blocks from %d to %d so every Famem rank fits its physical arena.",
+            current_num_blocks,
+            target_num_blocks,
+        )
+        return kv_cache_configs
+
+    @classmethod
+    def validate_sleep_level(cls, vllm_config: VllmConfig, level: int) -> None:
+        from vllm_ascend.device_allocator.multiproc_pipe_config import is_multiproc_pipe_enabled
+
+        if is_multiproc_pipe_enabled(vllm_config) and level > 1:
+            raise ValueError(
+                "multiproc_pipe supports only level 1 physical sleep because its weight image is immutable."
+            )
+
+    @classmethod
+    def validate_wake_tags(cls, vllm_config: VllmConfig, tags: list[str] | None) -> None:
+        physical_tags = [tag for tag in tags or () if tag != "scheduling"]
+        if get_famem_config(vllm_config).enabled and physical_tags:
+            raise ValueError("Famem wake_up restores the whole weight image; pass tags=None.")
+
+    @classmethod
+    def validate_resume_tags(cls, vllm_config: VllmConfig, tags: list[str] | None) -> None:
+        if get_famem_config(vllm_config).enabled and tags is not None:
+            raise ValueError("Famem resume restores the whole weight image; pass tags=None.")
 
     @classmethod
     def _get_default_max_cudagraph_capture_size(cls, vllm_config: VllmConfig) -> int | None:
@@ -269,6 +410,21 @@ class NPUPlatform(Platform):
             )
 
     @classmethod
+    def _validate_famem_config(cls, vllm_config: VllmConfig, ascend_config: Any) -> None:
+        from vllm_ascend.device_allocator.multiproc_pipe_config import is_multiproc_pipe_enabled
+
+        famem_config = get_famem_config(vllm_config)
+        famem_config.validate()
+        if not famem_config.enabled:
+            return
+        if not is_multiproc_pipe_enabled(vllm_config):
+            raise ValueError("Famem requires --multiproc-pipe because it builds on the wake-up pipeline memory ABI.")
+        if not envs_ascend.COMPILE_CUSTOM_KERNELS:
+            raise ValueError("Famem requires vllm-ascend to be built with COMPILE_CUSTOM_KERNELS=1.")
+        if get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3):
+            raise ValueError("Famem is supported only on Ascend A2 and A3 devices.")
+
+    @classmethod
     def _validate_multiproc_pipe_config(cls, vllm_config: VllmConfig, ascend_config: Any) -> None:
         from vllm_ascend.device_allocator.multiproc_pipe_config import (
             SUPPORTED_MULTIPROC_PIPE_TP_SIZES,
@@ -277,17 +433,54 @@ class NPUPlatform(Platform):
 
         if not is_multiproc_pipe_enabled(vllm_config):
             return
+
+        if envs_vllm.VLLM_WORKER_MULTIPROC_METHOD != "spawn":
+            raise ValueError(
+                "multiproc_pipe requires VLLM_WORKER_MULTIPROC_METHOD=spawn. "
+                "Set it before constructing LLM and guard programmatic entrypoints "
+                'with if __name__ == "__main__".'
+            )
+        if not envs_vllm.VLLM_ENABLE_V1_MULTIPROCESSING:
+            raise ValueError(
+                "multiproc_pipe requires VLLM_ENABLE_V1_MULTIPROCESSING=1. "
+                "Its Camem allocator callbacks and physical-memory handles have process lifetime and require "
+                "EngineCore process exit as the final cleanup boundary."
+            )
         if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
             raise ValueError("multiproc_pipe does not support the experimental v2 model runner.")
         model_config = vllm_config.model_config
         if model_config is None or not model_config.enable_sleep_mode:
             raise ValueError("multiproc_pipe requires --enable-sleep-mode.")
+        if envs_ascend.VLLM_ASCEND_ENABLE_NZ != 0:
+            raise ValueError(
+                "multiproc_pipe requires VLLM_ASCEND_ENABLE_NZ=0 because FRACTAL_NZ weights cannot be restored "
+                "through the sleep/wake lifecycle."
+            )
         if not model_config.enforce_eager:
             raise ValueError("multiproc_pipe currently requires --enforce-eager.")
         if getattr(vllm_config, "speculative_config", None) is not None:
             raise ValueError("multiproc_pipe does not support speculative decoding.")
         if getattr(vllm_config, "lora_config", None) is not None:
             raise ValueError("multiproc_pipe does not support LoRA.")
+        if getattr(getattr(vllm_config, "cache_config", None), "calculate_kv_scales", False):
+            raise ValueError("multiproc_pipe does not support calculate_kv_scales after its immutable weight backup.")
+        eplb_config = getattr(ascend_config, "eplb_config", None)
+        additional_config = vllm_config.additional_config or {}
+        if isinstance(additional_config, Mapping) and additional_config.get("layer_sharding"):
+            raise ValueError(
+                "multiproc_pipe does not support layer_sharding because it rotates "
+                "weight storage after the Copier captures its immutable image."
+            )
+        configured_eplb = additional_config.get("eplb_config", {}) if isinstance(additional_config, Mapping) else {}
+        dynamic_eplb_enabled = bool(eplb_config is not None and getattr(eplb_config, "dynamic_eplb", False))
+        if isinstance(configured_eplb, Mapping):
+            dynamic_eplb_enabled = dynamic_eplb_enabled or bool(configured_eplb.get("dynamic_eplb", False))
+            dynamic_eplb_enabled = dynamic_eplb_enabled or configured_eplb.get("expert_map_record_path") is not None
+        if dynamic_eplb_enabled:
+            raise ValueError(
+                "multiproc_pipe does not support dynamic EPLB because its Copier restores "
+                "the immutable weight image captured during model initialization."
+            )
         supported_architectures = {
             "Qwen2ForCausalLM",
             "DeepseekV2ForCausalLM",
@@ -311,10 +504,12 @@ class NPUPlatform(Platform):
             raise ValueError("multiproc_pipe does not support decode context parallelism.")
         if parallel_config.nnodes != 1:
             raise ValueError("multiproc_pipe supports single-node workers only.")
-        if parallel_config.distributed_executor_backend not in (None, "mp", "uni"):
-            raise ValueError("multiproc_pipe supports only local uniprocess or multiprocessing executors.")
+        if parallel_config.distributed_executor_backend != "mp":
+            raise ValueError("multiproc_pipe requires --distributed-executor-backend mp.")
         if parallel_config.worker_cls not in ("auto", "vllm_ascend.worker.worker.NPUWorker"):
             raise ValueError("multiproc_pipe requires the standard vllm-ascend NPUWorker.")
+        if getattr(parallel_config, "worker_extension_cls", ""):
+            raise ValueError("multiproc_pipe does not support Worker extensions that can mutate captured weights.")
         if ascend_config.xlite_graph_config.enabled:
             raise ValueError("multiproc_pipe is not compatible with the Xlite worker.")
 
@@ -332,6 +527,7 @@ class NPUPlatform(Platform):
 
         ascend_config = init_ascend_config(vllm_config)
         cls._validate_multiproc_pipe_config(vllm_config, ascend_config)
+        cls._validate_famem_config(vllm_config, ascend_config)
 
         if vllm_config.kv_transfer_config is not None:
             check_kv_extra_config(vllm_config)

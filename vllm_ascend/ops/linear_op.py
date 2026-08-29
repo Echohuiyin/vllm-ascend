@@ -279,6 +279,10 @@ class Flashcomm2OProjRowParallelOp(CustomRowParallelOp):
         self.group_indices = torch.tensor(self.reorgnized_batch_ids).npu()
         self.layer._quant_comm_config = {}
 
+    def get_multiproc_pipe_persistent_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the immutable routing index read by every OTP dispatch."""
+        return (self.group_indices,)
+
     @property
     def comm_group(self):
         return get_flashcomm2_otp_group()

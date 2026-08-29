@@ -40,7 +40,12 @@ from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
-from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
+from vllm_ascend.ops.fused_moe.moe_comm_method import (
+    AllGatherCommImpl,
+    FusedExpertsResult,
+    get_moe_comm_method,
+    setup_moe_comm_method,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
@@ -373,6 +378,25 @@ class AscendFusedMoE(FusedMoE):
         setup_moe_comm_method(self.moe_config)
         self.quant_type = self._get_quant_type()
         self.runner = self._init_runner()
+
+    def get_multiproc_pipe_persistent_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Expose persistent NPU state owned by the global MoE registry.
+
+        The ALLTOALL dispatcher creates this routing constant once and reads it
+        on every dispatch. It is not attached to the model's Module tree, so a
+        Famem/Camem restore must include it explicitly. Other registry tensors,
+        such as Fused-MC2 expert-token workspace, are overwritten before use
+        and must not be added to the persistent image.
+        """
+        comm_method = get_moe_comm_method(MoECommType.ALLTOALL)
+        if comm_method is None:
+            return ()
+        expert_ids = getattr(
+            comm_method.token_dispatcher,
+            "expert_ids_per_ep_rank",
+            None,
+        )
+        return (expert_ids,) if isinstance(expert_ids, torch.Tensor) else ()
 
     def _init_runner(self):
         # Storing the runner in the FusedMoE is an intermediate state, eventually

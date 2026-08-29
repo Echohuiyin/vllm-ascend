@@ -44,12 +44,25 @@ class TestNPUPlatform(TestBase):
         mock_ascend_config.recompute_scheduler_enable = False
         mock_ascend_config.SLO_limits_for_dynamic_batch = -1
         mock_ascend_config.enable_shared_expert_dp = False
+        mock_ascend_config.eplb_config.dynamic_eplb = False
         mock_ascend_config.update_compile_ranges_split_points = MagicMock()
         return mock_ascend_config
 
     def setUp(self):
         self.platform = NPUPlatform()
         self.platform.supported_quantization[:] = ["ascend", "compressed-tensors"]
+        multiproc_method_patcher = patch(
+            "vllm_ascend.platform.envs_vllm.VLLM_WORKER_MULTIPROC_METHOD",
+            "spawn",
+        )
+        multiproc_method_patcher.start()
+        self.addCleanup(multiproc_method_patcher.stop)
+        nz_mode_patcher = patch(
+            "vllm_ascend.platform.envs_ascend.VLLM_ASCEND_ENABLE_NZ",
+            0,
+        )
+        nz_mode_patcher.start()
+        self.addCleanup(nz_mode_patcher.stop)
 
     def test_class_variables(self):
         self.assertEqual(NPUPlatform._enum, PlatformEnum.OOT)
@@ -69,9 +82,11 @@ class TestNPUPlatform(TestBase):
         self.platform._register_allocator_cli_args(parser)
         self.platform._register_allocator_cli_args(parser)
 
-        args = parser.parse_args(["--multiproc-pipe"])
+        args = parser.parse_args(["--multiproc-pipe", "--use-famem-allocator", "--use-famem-allocator-size", "48"])
 
         self.assertTrue(args.multiproc_pipe)
+        self.assertTrue(args.use_famem_allocator)
+        self.assertEqual(args.use_famem_allocator_size, 48)
 
         disabled_args = parser.parse_args(["--no-multiproc-pipe"])
         self.assertFalse(disabled_args.multiproc_pipe)
@@ -84,11 +99,20 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(args.additional_config, {"other": True, "multiproc_pipe": True})
 
     @staticmethod
+    def _famem_fit(num_blocks):
+        return {
+            "num_blocks": num_blocks,
+            "native_bytes": 1200,
+            "available_bytes": 1300,
+        }
+
+    @staticmethod
     def _valid_multiproc_pipe_config():
         return SimpleNamespace(
             additional_config={"multiproc_pipe": True},
             speculative_config=None,
             lora_config=None,
+            cache_config=SimpleNamespace(calculate_kv_scales=False),
             model_config=SimpleNamespace(
                 enable_sleep_mode=True,
                 enforce_eager=True,
@@ -103,12 +127,141 @@ class TestNPUPlatform(TestBase):
                 nnodes=1,
                 distributed_executor_backend="mp",
                 worker_cls="auto",
+                worker_extension_cls="",
             ),
         )
 
+    @staticmethod
+    def _valid_famem_config():
+        config = TestNPUPlatform._valid_multiproc_pipe_config()
+        config.additional_config["use_fast_map_allocator"] = {
+            "enabled": True,
+            "size_gib": 32,
+        }
+        config.parallel_config.tensor_parallel_size = 1
+        return config
+
+    def test_adjust_kv_cache_configs_uses_minimum_worker_fit(self):
+        vllm_config = SimpleNamespace(
+            additional_config={"use_fast_map_allocator": {"enabled": True, "size_gib": 1}},
+            model_config=SimpleNamespace(max_model_len=2048, original_max_model_len=2048),
+        )
+        configs = [
+            SimpleNamespace(
+                num_blocks=10,
+                kv_cache_tensors=[SimpleNamespace(size=1000)],
+                kv_cache_groups=[object()],
+            )
+            for _ in range(2)
+        ]
+        executor = MagicMock()
+        executor.collective_rpc.return_value = [self._famem_fit(9), self._famem_fit(8)]
+
+        with patch(
+            "vllm.v1.core.kv_cache_utils.get_max_concurrency_for_kv_cache_config",
+            return_value=1.0,
+        ):
+            adjusted = NPUPlatform.adjust_kv_cache_configs(vllm_config, executor, configs)
+
+        self.assertIs(adjusted, configs)
+        self.assertEqual([config.num_blocks for config in configs], [8, 8])
+        self.assertEqual([config.kv_cache_tensors[0].size for config in configs], [800, 800])
+        executor.collective_rpc.assert_called_once_with(
+            "get_famem_kv_cache_block_fit",
+            args=(configs,),
+        )
+
+    def test_adjust_kv_cache_configs_revalidates_auto_fitted_model_len(self):
+        model_config = SimpleNamespace(max_model_len=1000, original_max_model_len=-1)
+        vllm_config = SimpleNamespace(
+            additional_config={"use_fast_map_allocator": {"enabled": True, "size_gib": 1}},
+            model_config=model_config,
+        )
+        config = SimpleNamespace(
+            num_blocks=10,
+            kv_cache_tensors=[SimpleNamespace(size=1000)],
+            kv_cache_groups=[object()],
+        )
+        executor = MagicMock()
+        executor.collective_rpc.return_value = [self._famem_fit(4)]
+
+        def get_concurrency(current_vllm_config, current_config):
+            blocks_per_request = (current_vllm_config.model_config.max_model_len + 99) // 100
+            return current_config.num_blocks / blocks_per_request
+
+        with patch(
+            "vllm.v1.core.kv_cache_utils.get_max_concurrency_for_kv_cache_config",
+            side_effect=get_concurrency,
+        ):
+            NPUPlatform.adjust_kv_cache_configs(vllm_config, executor, [config])
+
+        self.assertEqual(config.num_blocks, 4)
+        self.assertEqual(model_config.max_model_len, 400)
+
+    def test_validate_multiproc_pipe_sleep_level(self):
+        config = self._valid_famem_config()
+
+        NPUPlatform.validate_sleep_level(config, 0)
+        NPUPlatform.validate_sleep_level(config, 1)
+        with self.assertRaisesRegex(ValueError, "only level 1"):
+            NPUPlatform.validate_sleep_level(config, 2)
+
+        config.additional_config.pop("use_fast_map_allocator")
+        with self.assertRaisesRegex(ValueError, "only level 1"):
+            NPUPlatform.validate_sleep_level(config, 2)
+
+        config.additional_config = {}
+        NPUPlatform.validate_sleep_level(config, 2)
+
+    def test_validate_famem_wake_tags(self):
+        config = self._valid_famem_config()
+
+        for tags in (None, [], ["scheduling"]):
+            NPUPlatform.validate_wake_tags(config, tags)
+        with self.assertRaisesRegex(ValueError, "pass tags=None"):
+            NPUPlatform.validate_wake_tags(config, ["scheduling", "weights"])
+        NPUPlatform.validate_resume_tags(config, None)
+        for tags in ([], ["scheduling"], ["weights"]):
+            with self.assertRaisesRegex(ValueError, "pass tags=None"):
+                NPUPlatform.validate_resume_tags(config, tags)
+
+        config.additional_config = {}
+        NPUPlatform.validate_wake_tags(config, ["weights"])
+        NPUPlatform.validate_resume_tags(config, ["weights"])
+
+    def test_postprocess_famem_cli_args(self):
+        args = SimpleNamespace(
+            additional_config={"other": True},
+            multiproc_pipe=True,
+            use_famem_allocator=True,
+            use_famem_allocator_size=32,
+        )
+
+        self.platform.postprocess_cli_args(args)
+
+        self.assertEqual(
+            args.additional_config,
+            {
+                "other": True,
+                "multiproc_pipe": True,
+                "use_fast_map_allocator": {"enabled": True, "size_gib": 32},
+            },
+        )
+
+    def test_validate_famem_requires_multiproc_pipe(self):
+        vllm_config = SimpleNamespace(
+            additional_config={"use_fast_map_allocator": {"enabled": True, "size_gib": 32}},
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires --multiproc-pipe"):
+            self.platform._validate_famem_config(vllm_config, SimpleNamespace())
+
     @patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False)
     def test_validate_multiproc_pipe_accepts_supported_eager_model(self):
-        ascend_config = SimpleNamespace(xlite_graph_config=SimpleNamespace(enabled=False))
+        ascend_config = SimpleNamespace(
+            xlite_graph_config=SimpleNamespace(enabled=False),
+            eplb_config=SimpleNamespace(dynamic_eplb=False),
+        )
 
         for tensor_parallel_size in (1, 2, 4, 8):
             with self.subTest(tensor_parallel_size=tensor_parallel_size):
@@ -120,6 +273,105 @@ class TestNPUPlatform(TestBase):
         vllm_config.model_config.enforce_eager = False
         with self.assertRaisesRegex(ValueError, "requires --enforce-eager"):
             self.platform._validate_multiproc_pipe_config(vllm_config, ascend_config)
+
+    @patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False)
+    def test_validate_multiproc_pipe_rejects_fractal_nz(self):
+        config = self._valid_multiproc_pipe_config()
+        ascend_config = SimpleNamespace(
+            xlite_graph_config=SimpleNamespace(enabled=False),
+            eplb_config=SimpleNamespace(dynamic_eplb=False),
+        )
+
+        with (
+            patch("vllm_ascend.platform.envs_ascend.VLLM_ASCEND_ENABLE_NZ", 1),
+            self.assertRaisesRegex(ValueError, "VLLM_ASCEND_ENABLE_NZ=0"),
+        ):
+            self.platform._validate_multiproc_pipe_config(config, ascend_config)
+
+    @patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False)
+    def test_validate_multiproc_pipe_requires_spawn(self):
+        config = self._valid_multiproc_pipe_config()
+        ascend_config = SimpleNamespace(
+            xlite_graph_config=SimpleNamespace(enabled=False),
+            eplb_config=SimpleNamespace(dynamic_eplb=False),
+        )
+
+        with (
+            patch(
+                "vllm_ascend.platform.envs_vllm.VLLM_WORKER_MULTIPROC_METHOD",
+                "fork",
+            ),
+            self.assertRaisesRegex(ValueError, "VLLM_WORKER_MULTIPROC_METHOD=spawn"),
+        ):
+            self.platform._validate_multiproc_pipe_config(config, ascend_config)
+
+        config.additional_config = {}
+        with patch(
+            "vllm_ascend.platform.envs_vllm.VLLM_WORKER_MULTIPROC_METHOD",
+            "fork",
+        ):
+            self.platform._validate_multiproc_pipe_config(config, ascend_config)
+
+    @patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False)
+    def test_validate_multiproc_pipe_requires_enginecore_process(self):
+        config = self._valid_multiproc_pipe_config()
+        ascend_config = SimpleNamespace(
+            xlite_graph_config=SimpleNamespace(enabled=False),
+            eplb_config=SimpleNamespace(dynamic_eplb=False),
+        )
+
+        with (
+            patch(
+                "vllm_ascend.platform.envs_vllm.VLLM_ENABLE_V1_MULTIPROCESSING",
+                False,
+            ),
+            self.assertRaisesRegex(ValueError, "VLLM_ENABLE_V1_MULTIPROCESSING=1"),
+        ):
+            self.platform._validate_multiproc_pipe_config(config, ascend_config)
+
+        config.additional_config = {}
+        with patch(
+            "vllm_ascend.platform.envs_vllm.VLLM_ENABLE_V1_MULTIPROCESSING",
+            False,
+        ):
+            self.platform._validate_multiproc_pipe_config(config, ascend_config)
+
+    @patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False)
+    def test_validate_multiproc_pipe_rejects_dynamic_eplb(self):
+        ascend_config = SimpleNamespace(
+            xlite_graph_config=SimpleNamespace(enabled=False),
+            eplb_config=SimpleNamespace(dynamic_eplb=False),
+        )
+
+        for name, eplb_config in (
+            ("dynamic update", {"dynamic_eplb": True}),
+            ("map recording", {"expert_map_record_path": "/tmp/eplb.json"}),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "dynamic EPLB"):
+                config = self._valid_multiproc_pipe_config()
+                config.additional_config["eplb_config"] = eplb_config
+                self.platform._validate_multiproc_pipe_config(config, ascend_config)
+
+        config = self._valid_multiproc_pipe_config()
+        config.additional_config["eplb_config"] = {"expert_map_path": "/tmp/eplb.json"}
+        self.platform._validate_multiproc_pipe_config(config, ascend_config)
+
+        config = self._valid_multiproc_pipe_config()
+        ascend_config.eplb_config.dynamic_eplb = True
+        with self.assertRaisesRegex(ValueError, "dynamic EPLB"):
+            self.platform._validate_multiproc_pipe_config(config, ascend_config)
+
+    @patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False)
+    def test_validate_multiproc_pipe_rejects_layer_sharding(self):
+        config = self._valid_multiproc_pipe_config()
+        config.additional_config["layer_sharding"] = ["q_b_proj", "o_proj"]
+        ascend_config = SimpleNamespace(
+            xlite_graph_config=SimpleNamespace(enabled=False),
+            eplb_config=SimpleNamespace(dynamic_eplb=False),
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not support layer_sharding"):
+            self.platform._validate_multiproc_pipe_config(config, ascend_config)
 
     @patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False)
     def test_validate_multiproc_pipe_rejects_unsupported_modes(self):
@@ -148,6 +400,11 @@ class TestNPUPlatform(TestBase):
                 "LoRA",
                 lambda config, ascend: setattr(config, "lora_config", SimpleNamespace()),
                 "LoRA",
+            ),
+            (
+                "dynamic KV scales",
+                lambda config, ascend: setattr(config.cache_config, "calculate_kv_scales", True),
+                "calculate_kv_scales",
             ),
             (
                 "tensor parallel",
@@ -182,12 +439,22 @@ class TestNPUPlatform(TestBase):
             (
                 "ray executor",
                 lambda config, ascend: setattr(config.parallel_config, "distributed_executor_backend", "ray"),
-                "local uniprocess or multiprocessing",
+                "distributed-executor-backend mp",
+            ),
+            (
+                "uniprocess executor",
+                lambda config, ascend: setattr(config.parallel_config, "distributed_executor_backend", "uni"),
+                "distributed-executor-backend mp",
             ),
             (
                 "custom worker",
                 lambda config, ascend: setattr(config.parallel_config, "worker_cls", "custom.Worker"),
                 "standard vllm-ascend NPUWorker",
+            ),
+            (
+                "worker extension",
+                lambda config, ascend: setattr(config.parallel_config, "worker_extension_cls", "custom.Extension"),
+                "Worker extensions",
             ),
             (
                 "xlite",
@@ -214,10 +481,26 @@ class TestNPUPlatform(TestBase):
         ):
             self.platform._validate_multiproc_pipe_config(config, ascend_config)
 
+    def test_validate_famem_rejects_missing_native_support(self):
+        config = self._valid_famem_config()
+        ascend_config = SimpleNamespace(xlite_graph_config=SimpleNamespace(enabled=False))
+
+        with (
+            patch("vllm_ascend.platform.envs_ascend.COMPILE_CUSTOM_KERNELS", False),
+            self.assertRaisesRegex(ValueError, "COMPILE_CUSTOM_KERNELS=1"),
+        ):
+            self.platform._validate_famem_config(config, ascend_config)
+
+        with (
+            patch("vllm_ascend.platform.envs_ascend.COMPILE_CUSTOM_KERNELS", True),
+            patch("vllm_ascend.platform.get_ascend_device_type", return_value=object()),
+            self.assertRaisesRegex(ValueError, "Ascend A2 and A3"),
+        ):
+            self.platform._validate_famem_config(config, ascend_config)
+
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
-    def test_pre_register_and_update_with_parser(self, mock_quant_config,
-                                                 mock_adapt_patch):
+    def test_pre_register_and_update_with_parser(self, mock_quant_config, mock_adapt_patch):
         mock_parser = MagicMock()
         mock_action = MagicMock()
         mock_action.choices = ["awq", "gptq"]
@@ -232,16 +515,14 @@ class TestNPUPlatform(TestBase):
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
-    def test_pre_register_and_update_without_parser(self, mock_quant_config,
-                                                    mock_adapt_patch):
+    def test_pre_register_and_update_without_parser(self, mock_quant_config, mock_adapt_patch):
         self.platform.pre_register_and_update(None)
 
         mock_adapt_patch.assert_called_once_with(is_global_patch=True)
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
-    def test_pre_register_and_update_with_parser_no_quant_action(
-            self, mock_quant_config, mock_adapt_patch):
+    def test_pre_register_and_update_with_parser_no_quant_action(self, mock_quant_config, mock_adapt_patch):
         mock_parser = MagicMock()
         mock_parser._option_string_actions = {}
 
@@ -251,8 +532,7 @@ class TestNPUPlatform(TestBase):
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
-    def test_pre_register_and_update_with_existing_ascend_quant(
-            self, mock_quant_config, mock_adapt_patch):
+    def test_pre_register_and_update_with_existing_ascend_quant(self, mock_quant_config, mock_adapt_patch):
         mock_parser = MagicMock()
         mock_action = MagicMock()
         mock_action.choices = ["awq", ASCEND_QUANTIZATION_METHOD]
@@ -277,9 +557,7 @@ class TestNPUPlatform(TestBase):
             ):
                 vllm_config = TestNPUPlatform.mock_vllm_config()
                 vllm_config.scheduler_config.max_num_seqs = max_num_seqs
-                vllm_config.speculative_config = MagicMock(
-                    num_speculative_tokens=num_speculative_tokens
-                )
+                vllm_config.speculative_config = MagicMock(num_speculative_tokens=num_speculative_tokens)
                 vllm_config.compilation_config.max_cudagraph_capture_size = None
                 vllm_config.compilation_config.cudagraph_capture_sizes = None
 
@@ -353,9 +631,7 @@ class TestNPUPlatform(TestBase):
 
         observed_inputs: list[int | None] = []
         vllm_config._set_cudagraph_sizes = MagicMock(
-            side_effect=lambda: observed_inputs.append(
-                vllm_config.compilation_config.max_cudagraph_capture_size
-            )
+            side_effect=lambda: observed_inputs.append(vllm_config.compilation_config.max_cudagraph_capture_size)
         )
 
         self.platform.check_and_update_config(vllm_config)
@@ -380,7 +656,7 @@ class TestNPUPlatform(TestBase):
         device_properties.uuid = "01020304-0000-0000-0000-01020304"
         mock_get_device_properties.return_value = device_properties
         self.assertEqual(self.platform.get_device_uuid(device_id), device_properties.uuid)
-        mock_get_device_properties.assert_called_once_with(0)        
+        mock_get_device_properties.assert_called_once_with(0)
 
     @patch("torch.inference_mode")
     def test_inference_mode(self, mock_inference_mode):
@@ -450,7 +726,9 @@ class TestNPUPlatform(TestBase):
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
     @patch("vllm_ascend.ascend_config.init_ascend_config")
     @patch("vllm_ascend.core.recompute_scheduler.RecomputeSchedulerConfig.initialize_from_config")
-    def test_check_and_update_config_enforce_eager_mode(self, mock_init_recompute, mock_init_ascend, mock_soc_version, mock_auto_detect):
+    def test_check_and_update_config_enforce_eager_mode(
+        self, mock_init_recompute, mock_init_ascend, mock_soc_version, mock_auto_detect
+    ):
         mock_init_ascend.return_value = TestNPUPlatform.mock_vllm_ascend_config()
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.model_config.enforce_eager = True
@@ -523,7 +801,9 @@ class TestNPUPlatform(TestBase):
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
     @patch("vllm_ascend.ascend_config.init_ascend_config")
-    def test_check_and_update_config_unsupported_cudagraph_mode(self, mock_init_ascend, mock_soc_version, mock_auto_detect):
+    def test_check_and_update_config_unsupported_cudagraph_mode(
+        self, mock_init_ascend, mock_soc_version, mock_auto_detect
+    ):
         mock_init_ascend.return_value = TestNPUPlatform.mock_vllm_ascend_config()
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.model_config.enforce_eager = False
@@ -594,9 +874,11 @@ class TestNPUPlatform(TestBase):
         importlib.reload(platform)
         self.platform = platform.NPUPlatform()
 
-        with pytest.raises(ValueError, match=r"recompute_scheduler_enable.*PD-disaggregated.*PD-mixed"):
-            with patch.object(platform.NPUPlatform, "_fix_incompatible_config"):
-                self.platform.check_and_update_config(vllm_config)
+        with (
+            pytest.raises(ValueError, match=r"recompute_scheduler_enable.*PD-disaggregated.*PD-mixed"),
+            patch.object(platform.NPUPlatform, "_fix_incompatible_config"),
+        ):
+            self.platform.check_and_update_config(vllm_config)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
@@ -622,12 +904,12 @@ class TestNPUPlatform(TestBase):
         importlib.reload(platform)
         self.platform = platform.NPUPlatform()
 
-        with pytest.raises(ValueError, match=r"recompute_scheduler_enable.*PD-disaggregated.*PD-mixed"):
-            with (
-                patch.object(platform.NPUPlatform, "_fix_incompatible_config"),
-                patch.object(platform, "check_kv_extra_config"),
-            ):
-                self.platform.check_and_update_config(vllm_config)
+        with (
+            pytest.raises(ValueError, match=r"recompute_scheduler_enable.*PD-disaggregated.*PD-mixed"),
+            patch.object(platform.NPUPlatform, "_fix_incompatible_config"),
+            patch.object(platform, "check_kv_extra_config"),
+        ):
+            self.platform.check_and_update_config(vllm_config)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
@@ -653,13 +935,13 @@ class TestNPUPlatform(TestBase):
         importlib.reload(platform)
         self.platform = platform.NPUPlatform()
 
-        with patch("vllm_ascend.platform.envs_ascend.VLLM_ASCEND_BALANCE_SCHEDULING", True, create=True):
-            with pytest.raises(ValueError, match=r"VLLM_ASCEND_BALANCE_SCHEDULING.*PD-mixed.*PD-disaggregated"):
-                with (
-                    patch.object(platform.NPUPlatform, "_fix_incompatible_config"),
-                    patch.object(platform, "check_kv_extra_config"),
-                ):
-                    self.platform.check_and_update_config(vllm_config)
+        with (
+            patch("vllm_ascend.platform.envs_ascend.VLLM_ASCEND_BALANCE_SCHEDULING", True, create=True),
+            pytest.raises(ValueError, match=r"VLLM_ASCEND_BALANCE_SCHEDULING.*PD-mixed.*PD-disaggregated"),
+            patch.object(platform.NPUPlatform, "_fix_incompatible_config"),
+            patch.object(platform, "check_kv_extra_config"),
+        ):
+            self.platform.check_and_update_config(vllm_config)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)
@@ -685,13 +967,13 @@ class TestNPUPlatform(TestBase):
         importlib.reload(platform)
         self.platform = platform.NPUPlatform()
 
-        with patch("vllm_ascend.platform.envs_ascend.VLLM_ASCEND_BALANCE_SCHEDULING", True, create=True):
-            with pytest.raises(ValueError, match=r"VLLM_ASCEND_BALANCE_SCHEDULING.*PD-mixed.*PD-disaggregated"):
-                with (
-                    patch.object(platform.NPUPlatform, "_fix_incompatible_config"),
-                    patch.object(platform, "check_kv_extra_config"),
-                ):
-                    self.platform.check_and_update_config(vllm_config)
+        with (
+            patch("vllm_ascend.platform.envs_ascend.VLLM_ASCEND_BALANCE_SCHEDULING", True, create=True),
+            pytest.raises(ValueError, match=r"VLLM_ASCEND_BALANCE_SCHEDULING.*PD-mixed.*PD-disaggregated"),
+            patch.object(platform.NPUPlatform, "_fix_incompatible_config"),
+            patch.object(platform, "check_kv_extra_config"),
+        ):
+            self.platform.check_and_update_config(vllm_config)
 
     def test_update_block_size_for_backend_preserves_hybrid_block_size(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
@@ -784,7 +1066,9 @@ class TestNPUPlatform(TestBase):
     @patch("vllm_ascend.ascend_config.init_ascend_config")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType._310P)
     @patch("vllm_ascend.core.recompute_scheduler.RecomputeSchedulerConfig.initialize_from_config")
-    def test_check_and_update_config_310p_no_custom_ops(self, mock_init_recompute, mock_soc_version, mock_init_ascend, mock_auto_detect):
+    def test_check_and_update_config_310p_no_custom_ops(
+        self, mock_init_recompute, mock_soc_version, mock_init_ascend, mock_auto_detect
+    ):
         mock_init_ascend.return_value = TestNPUPlatform.mock_vllm_ascend_config()
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.compilation_config.custom_ops = []

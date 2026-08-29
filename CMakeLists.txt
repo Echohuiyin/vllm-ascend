@@ -1,9 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
-project(vllm_ascend_C)
+project(vllm_ascend_C LANGUAGES C CXX)
 
 # include(CheckCXXcompilerFlag)
 # check_cxx_compiler_flag("-std=c++17", COMPILER_SUPPORTS_CXX17)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
@@ -19,6 +21,7 @@ append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
 set(VLLM_ASCEND_INSTALL_PATH "${CMAKE_INSTALL_PREFIX}")
 
 find_package(Torch REQUIRED)
+find_package(Threads REQUIRED)
 
 run_python(TORCH_VERSION
   "import torch; print(torch.__version__)" "Failed to locate torch path")
@@ -26,6 +29,11 @@ run_python(TORCH_VERSION
 if(NOT ${TORCH_VERSION} VERSION_EQUAL "2.9.0")
   message(FATAL_ERROR "Expected PyTorch version 2.9.0, but found ${TORCH_VERSION}")
 endif()
+
+# Famem is a plain shared library loaded by torch-npu's pluggable allocator.
+# Keep it independent from the existing pybind Camem implementation.
+set(FAMEM_ALLOCATOR_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/famem_allocator.cpp)
 
 set(RUN_MODE "npu" CACHE STRING "cpu/sim/npu")
 set(SOC_VERSION ${SOC_VERSION})
@@ -104,6 +112,8 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host/tiling/tiling_data.cpp)
 endif()
 
+list(REMOVE_ITEM VLLM_ASCEND_SRC ${FAMEM_ALLOCATOR_SRC})
+
 include_directories(
   ${pybind11_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_PATH}
@@ -125,6 +135,28 @@ set(
 )
 
 pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
+
+add_library(vllm_ascend_famem SHARED ${FAMEM_ALLOCATOR_SRC})
+target_include_directories(vllm_ascend_famem PRIVATE
+  ${ASCEND_HOME_PATH}/include)
+target_link_directories(vllm_ascend_famem PRIVATE
+  ${ASCEND_HOME_PATH}/lib64)
+target_link_libraries(vllm_ascend_famem PRIVATE ascendcl dl Threads::Threads)
+set_target_properties(vllm_ascend_famem PROPERTIES
+  OUTPUT_NAME vllm_ascend_famem)
+
+add_executable(vllm_ascend_hbm_server
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc/famem_hbm_server.c)
+target_include_directories(vllm_ascend_hbm_server PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/csrc)
+target_link_libraries(vllm_ascend_hbm_server PRIVATE
+  vllm_ascend_famem Threads::Threads)
+set_target_properties(vllm_ascend_hbm_server PROPERTIES
+  INSTALL_RPATH "$ORIGIN")
+
+add_dependencies(vllm_ascend_C
+  vllm_ascend_famem
+  vllm_ascend_hbm_server)
 
 target_link_directories(
   vllm_ascend_C
@@ -151,4 +183,6 @@ target_link_libraries(
 
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/vllm-ascend/op_api/lib")
 
-install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+install(TARGETS vllm_ascend_C vllm_ascend_kernels vllm_ascend_famem
+        vllm_ascend_hbm_server
+        DESTINATION ${VLLM_ASCEND_INSTALL_PATH})

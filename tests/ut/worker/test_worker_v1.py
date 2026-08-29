@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import torch
 from vllm.config import CacheConfig, ModelConfig, ParallelConfig, ProfilerConfig, VllmConfig
@@ -1208,6 +1209,82 @@ class TestNPUWorker(TestBase):
             # Verify calls
             worker.model_runner.initialize_kv_cache.assert_called_once_with(
                 mock_kv_cache_config)
+
+    def test_initialize_from_config_famem_preflight_fails_before_pool_entry(self):
+        from vllm_ascend.device_allocator.famem import FaMemAllocator
+        from vllm_ascend.device_allocator.kv_cache_plan import (
+            KVCacheAllocationPlan,
+            KVCacheAllocationRequest,
+        )
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.model_config.enable_sleep_mode = True
+            allocator = object.__new__(FaMemAllocator)
+            allocator.stats = MagicMock(return_value=MagicMock(heap_top=0))
+            worker._get_sleep_mode_allocator = MagicMock(return_value=allocator)
+            worker.model_runner.get_kv_cache_allocation_plan.return_value = KVCacheAllocationPlan(
+                (KVCacheAllocationRequest(payload_bytes=101),)
+            )
+            kv_cache_config = MagicMock()
+            kv_cache_config.num_blocks = 1
+
+            with (
+                patch.object(
+                    FaMemAllocator,
+                    "available_bytes",
+                    new_callable=PropertyMock,
+                    return_value=100,
+                ),
+                self.assertRaisesRegex(MemoryError, "preflight exceeds"),
+            ):
+                worker.initialize_from_config(kv_cache_config)
+
+            worker.model_runner.initialize_kv_cache.assert_not_called()
+
+    def test_initialize_from_config_verifies_famem_native_consumption(self):
+        from vllm_ascend.device_allocator.famem import FaMemAllocator
+        from vllm_ascend.device_allocator.kv_cache_plan import (
+            KVCacheAllocationPlan,
+            KVCacheAllocationRequest,
+        )
+        from vllm_ascend.worker.worker import NPUWorker
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.model_config.enable_sleep_mode = True
+            allocator = object.__new__(FaMemAllocator)
+            plan = KVCacheAllocationPlan((KVCacheAllocationRequest(payload_bytes=2 << 20),))
+            planned_bytes = plan.native_bytes_upper_bound()
+            before = SimpleNamespace(heap_top=1024)
+            after = SimpleNamespace(heap_top=1024 + planned_bytes, capacity=32 << 20)
+            allocator.stats = MagicMock(side_effect=[before, after])
+            allocator.use_memory_pool = MagicMock(return_value=MagicMock())
+            worker._get_sleep_mode_allocator = MagicMock(return_value=allocator)
+            worker.model_runner.get_kv_cache_allocation_plan.return_value = plan
+            kv_cache_config = MagicMock(num_blocks=1)
+
+            with (
+                patch.object(
+                    FaMemAllocator,
+                    "available_bytes",
+                    new_callable=PropertyMock,
+                    return_value=32 << 20,
+                ),
+                patch("vllm_ascend.worker.worker.ensure_kv_transfer_initialized"),
+            ):
+                worker.initialize_from_config(kv_cache_config)
+
+            worker.model_runner.initialize_kv_cache.assert_called_once_with(
+                kv_cache_config,
+                expected_allocation_plan=plan,
+            )
+            self.assertEqual(allocator.stats.call_count, 2)
 
     @patch("vllm_ascend.worker.worker.enable_sp", return_value=False)
     @patch("vllm_ascend.worker.worker.get_pp_group")

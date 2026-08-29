@@ -19,13 +19,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from vllm_ascend import envs
 from vllm_ascend.device_allocator.camem import CaMemAllocator
+from vllm_ascend.device_allocator.famem import FaMemAllocator
+from vllm_ascend.device_allocator.famem_config import get_famem_config
 from vllm_ascend.device_allocator.multiproc_pipe_config import is_multiproc_pipe_enabled
 
-_active_sleep_mode_allocator: CaMemAllocator | None = None
+_active_sleep_mode_allocator: CaMemAllocator | FaMemAllocator | None = None
 
 
-def get_active_sleep_mode_allocator() -> CaMemAllocator:
+def get_active_sleep_mode_allocator() -> CaMemAllocator | FaMemAllocator:
     """Return the allocator used by the current worker's model forward."""
     if _active_sleep_mode_allocator is None:
         raise RuntimeError("The worker sleep-mode allocator is not initialized")
@@ -33,15 +36,28 @@ def get_active_sleep_mode_allocator() -> CaMemAllocator:
 
 
 def _register_active_allocator(
-    allocator: CaMemAllocator,
-) -> CaMemAllocator:
+    allocator: CaMemAllocator | FaMemAllocator,
+) -> CaMemAllocator | FaMemAllocator:
     global _active_sleep_mode_allocator
     _active_sleep_mode_allocator = allocator
     return allocator
 
 
-def create_sleep_mode_allocator(vllm_config: Any, device: Any) -> CaMemAllocator:
-    del device
+def create_sleep_mode_allocator(vllm_config: Any, device: Any) -> CaMemAllocator | FaMemAllocator:
+    famem_config = get_famem_config(vllm_config)
     multiproc_pipe = is_multiproc_pipe_enabled(vllm_config)
-    CaMemAllocator.set_pipeline_switch(multiproc_pipe)
-    return _register_active_allocator(CaMemAllocator.get_instance())
+    if not famem_config.enabled:
+        CaMemAllocator.set_pipeline_switch(multiproc_pipe)
+        return _register_active_allocator(CaMemAllocator.get_instance())
+    if not multiproc_pipe:
+        raise ValueError("Famem requires multiproc_pipe to be enabled.")
+    device_index = getattr(device, "index", device)
+    if device_index is None:
+        raise ValueError("Famem requires an explicit NPU device index.")
+    return _register_active_allocator(
+        FaMemAllocator(
+            device=int(device_index),
+            capacity=famem_config.size_bytes,
+            socket_dir=envs.VLLM_ASCEND_FAMEM_SOCKET_DIR,
+        )
+    )

@@ -37,7 +37,9 @@ class TestEnvVariables(TestBase):
                                      var_handler())
 
                     handler_source = inspect.getsource(var_handler)
-                    if 'int(' in handler_source:
+                    if 'float(' in handler_source:
+                        test_vals = ["1.5", "2.0"]
+                    elif 'int(' in handler_source:
                         test_vals = ["123", "456"]
                     elif 'bool(int(' in handler_source:
                         test_vals = ["0", "1"]

@@ -9,6 +9,7 @@ graph_mode
 cpu_binding
 quantization
 sleep_mode
+famem_allocator
 structured_output
 lora
 eplb_swift_balancer

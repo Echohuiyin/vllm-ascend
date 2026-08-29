@@ -230,6 +230,10 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         _record_cos_sin_cache(self.cos_sin_cache)
         _record_cos_and_sin_cache_interleaved(self.cos_sin_cache)
 
+    def get_multiproc_pipe_persistent_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Expose detached global RoPE caches read directly by MLA/SFA."""
+        return tuple(tensor for tensor in (_cos_cache, _sin_cache) if isinstance(tensor, torch.Tensor))
+
     def forward_oot(
         self,
         positions: torch.Tensor,

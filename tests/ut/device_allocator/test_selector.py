@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
+from vllm_ascend import envs
 from vllm_ascend.device_allocator.selector import (
     create_sleep_mode_allocator,
     get_active_sleep_mode_allocator,
@@ -51,3 +52,41 @@ def test_selector_supports_camem_modes(multiproc_pipe, enable_share_handle):
     assert allocator is camem_instance
     set_pipeline_switch.assert_called_once_with(enable_share_handle)
     get_camem_instance.assert_called_once_with()
+
+
+def test_selector_supports_famem_mode():
+    config = SimpleNamespace(
+        additional_config={
+            "multiproc_pipe": True,
+            "use_fast_map_allocator": {"enabled": True, "size_gib": 32},
+        }
+    )
+    famem_instance = object()
+    with (
+        patch("vllm_ascend.device_allocator.selector.CaMemAllocator.get_instance") as get_camem_instance,
+        patch(
+            "vllm_ascend.device_allocator.selector.FaMemAllocator",
+            return_value=famem_instance,
+        ) as create_famem,
+    ):
+        allocator = create_sleep_mode_allocator(config, 1)
+        assert get_active_sleep_mode_allocator() is allocator
+
+    assert allocator is famem_instance
+    get_camem_instance.assert_not_called()
+    create_famem.assert_called_once_with(
+        device=1,
+        capacity=32 * 1024**3,
+        socket_dir=envs.VLLM_ASCEND_FAMEM_SOCKET_DIR,
+    )
+
+
+def test_selector_rejects_famem_without_multiproc_pipe():
+    config = SimpleNamespace(
+        additional_config={
+            "multiproc_pipe": False,
+            "use_fast_map_allocator": {"enabled": True, "size_gib": 32},
+        }
+    )
+    with pytest.raises(ValueError, match="requires multiproc_pipe"):
+        create_sleep_mode_allocator(config, 0)

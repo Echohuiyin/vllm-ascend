@@ -19,6 +19,8 @@ e2e-singlecard:
   estimated_time: 506
 - name: tests/e2e/singlecard/test_camem.py
   estimated_time: 320
+- name: tests/e2e/singlecard/test_famem.py
+  estimated_time: 540
 - name: tests/e2e/singlecard/test_completion_with_prompt_embeds.py
   estimated_time: 136
 - name: tests/e2e/singlecard/test_cpu_offloading.py

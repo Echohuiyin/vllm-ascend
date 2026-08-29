@@ -532,6 +532,9 @@ setup(
     cmdclass=cmdclass,
     extras_require={},
     entry_points={
+        "console_scripts": [
+            "vllm-ascend-hbm-server = vllm_ascend.device_allocator.hbm_server_launcher:main",
+        ],
         "vllm.platform_plugins": ["ascend = vllm_ascend:register"],
         "vllm.general_plugins": [
             "ascend_kv_connector = vllm_ascend:register_connector",

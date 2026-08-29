@@ -19,6 +19,7 @@
 
 import copy
 import gc
+import os
 from types import NoneType
 
 import torch
@@ -56,6 +57,15 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
+from vllm_ascend.device_allocator.famem import FaMemAllocator
+from vllm_ascend.device_allocator.famem_config import (
+    calculate_famem_memory_budget,
+    get_famem_config,
+)
+from vllm_ascend.device_allocator.kv_cache_plan import (
+    KVCacheAllocationPlan,
+    find_max_fitting_blocks,
+)
 from vllm_ascend.device_allocator.multiproc_pipe_config import (
     is_multiproc_pipe_enabled,
 )
@@ -136,7 +146,7 @@ class NPUWorker(WorkerBase):
         if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
             # Buffers saved before sleep
             self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
-        self._sleep_mode_allocator: CaMemAllocator | None = None
+        self._sleep_mode_allocator: CaMemAllocator | FaMemAllocator | None = None
         self.layer_ready_events = None
         if is_multiproc_pipe_enabled(vllm_config):
             from vllm.utils.system_utils import get_mp_context
@@ -222,19 +232,23 @@ class NPUWorker(WorkerBase):
                     return
 
     def sleep(self, level: int = 1) -> None:
+        allocator = self._get_sleep_mode_allocator()
+        if allocator.multiproc_pipe_enabled and level != 1:
+            raise ValueError(
+                "multiproc_pipe supports only level 1 physical sleep because its weight image is immutable."
+            )
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
         # Save the buffers before level 2 sleep
         if level == 2:
             model = self.model_runner.model
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
-        allocator = self._get_sleep_mode_allocator()
         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
         free_bytes_after_sleep, total = torch.npu.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
         assert freed_bytes >= 0, "Memory usage increased after sleeping."
         logger.info(
-            "Sleep mode freed %.2f GiB memory, %.2f GiB memory is still in use.",
+            "Sleep mode completed; free HBM changed by %.2f GiB, %.2f GiB memory is still in use.",
             freed_bytes / GiB_bytes,
             used_bytes / GiB_bytes,
         )
@@ -281,7 +295,7 @@ class NPUWorker(WorkerBase):
                     setattr(parent_module, param_name, w13_data)
 
     def suspend(self, level: int = 1) -> None:
-        """Release memory for the multiprocess layer-wise restore path."""
+        """Suspend the multiprocess layer-wise restore path."""
         if not is_multiproc_pipe_enabled(self.vllm_config):
             logger.warning("multiproc_pipe is disabled; ignoring suspend request")
             return
@@ -292,7 +306,7 @@ class NPUWorker(WorkerBase):
         allocator.suspend(offload_tags=("weights",))
         free_bytes_after, total = torch.npu.mem_get_info()
         logger.info(
-            "multiproc_pipe suspend freed %.2f GiB; %.2f GiB remains in use",
+            "multiproc_pipe suspend completed; free HBM changed by %.2f GiB; %.2f GiB remains in use",
             (free_bytes_after - free_bytes_before) / GiB_bytes,
             (total - free_bytes_after) / GiB_bytes,
         )
@@ -328,16 +342,24 @@ class NPUWorker(WorkerBase):
         # take current memory snapshot
         self.init_snapshot = MemorySnapshot()
         self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization
-        if self.init_snapshot.free_memory < self.requested_memory:
+        famem_config = self._configured_famem()
+        available_memory = self.init_snapshot.free_memory + (famem_config.size_bytes if famem_config else 0)
+        if available_memory < self.requested_memory:
             GiB = lambda b: round(b / GiB_bytes, 2)
             raise ValueError(
-                f"Free memory on device "
-                f"({GiB(self.init_snapshot.free_memory)}/"
+                f"Available memory on device "
+                f"({GiB(available_memory)}/"
                 f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
                 f"is less than desired GPU memory utilization "
                 f"({self.cache_config.gpu_memory_utilization}, "
                 f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
                 f"utilization or reduce GPU memory used by other processes."
+            )
+
+        if famem_config is not None and famem_config.size_bytes > self.requested_memory:
+            raise ValueError(
+                f"Famem arena size ({famem_config.size_gib} GiB) exceeds the configured "
+                f"NPU memory budget ({self.requested_memory / GiB_bytes:.2f} GiB)."
             )
 
         if (
@@ -404,6 +426,27 @@ class NPUWorker(WorkerBase):
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+
+        allocator = getattr(self, "_sleep_mode_allocator", None)
+        if isinstance(allocator, FaMemAllocator):
+            physical_peak, available = calculate_famem_memory_budget(
+                initial_free_bytes=self.init_snapshot.free_memory,
+                after_profile_free_bytes=profile_result.after_profile.free_memory,
+                torch_peak_increase_bytes=profile_result.torch_peak_increase,
+                requested_memory_bytes=int(self.requested_memory),
+                arena_remaining_bytes=allocator.available_bytes,
+                granularity=allocator.granularity,
+                pool_capacity_bytes=allocator.capacity,
+            )
+            self.available_kv_cache_memory_bytes = available
+            logger.info_once(
+                "Candidate Famem KV cache memory: %.2f GiB (physical peak %.2f GiB); "
+                "the final capacity is calibrated against physical allocation requests",
+                GiB(available),
+                GiB(physical_peak),
+                scope="local",
+            )
+            return available
 
         free_gpu_memory = profile_result.after_profile.free_memory
         assert self.init_snapshot.free_memory > free_gpu_memory, (
@@ -490,7 +533,7 @@ class NPUWorker(WorkerBase):
         return self.model_runner.sample_tokens(grammar_output)
 
     def load_model(self) -> None:
-        allocator: CaMemAllocator | None = None
+        allocator: CaMemAllocator | FaMemAllocator | None = None
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = self._get_sleep_mode_allocator()
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
@@ -553,6 +596,20 @@ class NPUWorker(WorkerBase):
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
+        allocator = getattr(self, "_sleep_mode_allocator", None)
+        if isinstance(allocator, FaMemAllocator):
+            free_memory = torch.npu.mem_get_info()[0]
+            if free_memory > self.init_snapshot.free_memory:
+                raise RuntimeError(
+                    "Free NPU memory increased during Famem compilation; isolate the worker before validating memory."
+                )
+            physical_usage = allocator.capacity + self.init_snapshot.free_memory - free_memory
+            if physical_usage > self.requested_memory:
+                raise MemoryError(
+                    "Famem arena plus compiled graph/workspace memory exceeds gpu_memory_utilization: "
+                    f"usage={physical_usage / GiB_bytes:.2f} GiB, "
+                    f"budget={self.requested_memory / GiB_bytes:.2f} GiB."
+                )
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -598,7 +655,23 @@ class NPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
+        expected_allocation_plan: KVCacheAllocationPlan | None = None
+        famem_heap_top_before: int | None = None
+        planned_native_bytes: int | None = None
         allocator = self._get_sleep_mode_allocator() if self.vllm_config.model_config.enable_sleep_mode else None
+        if isinstance(allocator, FaMemAllocator):
+            expected_allocation_plan = self.model_runner.get_kv_cache_allocation_plan(kv_cache_config)
+            allocator_config = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "")
+            planned_native_bytes = expected_allocation_plan.native_bytes_upper_bound(allocator_config)
+            available_bytes = allocator.available_bytes
+            famem_heap_top_before = allocator.stats().heap_top
+            if planned_native_bytes > available_bytes:
+                raise MemoryError(
+                    "Famem KV cache preflight exceeds the remaining bump arena: "
+                    f"planned={planned_native_bytes} bytes, available={available_bytes} bytes, "
+                    f"requests={len(expected_allocation_plan.requests)}, blocks={kv_cache_config.num_blocks}."
+                )
+
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         if allocator is not None:
             context = allocator.use_memory_pool(tag="kv_cache")
@@ -607,15 +680,75 @@ class NPUWorker(WorkerBase):
 
             context = nullcontext()  # type: ignore
         with context:
-            self.model_runner.initialize_kv_cache(kv_cache_config)
+            if expected_allocation_plan is None:
+                self.model_runner.initialize_kv_cache(kv_cache_config)
+            else:
+                self.model_runner.initialize_kv_cache(
+                    kv_cache_config,
+                    expected_allocation_plan=expected_allocation_plan,
+                )
+            if isinstance(allocator, FaMemAllocator):
+                assert famem_heap_top_before is not None and planned_native_bytes is not None
+                stats_after = allocator.stats()
+                actual_native_bytes = stats_after.heap_top - famem_heap_top_before
+                if (
+                    actual_native_bytes < 0
+                    or actual_native_bytes > planned_native_bytes
+                    or stats_after.heap_top > stats_after.capacity
+                ):
+                    raise RuntimeError(
+                        "Famem KV cache allocation violated its physical plan: "
+                        f"actual={actual_native_bytes} bytes, planned<={planned_native_bytes} bytes, "
+                        f"heap_top={stats_after.heap_top}, capacity={stats_after.capacity}."
+                    )
+                logger.info(
+                    "Famem KV cache allocation consumed %.2f GiB (planned upper bound %.2f GiB).",
+                    actual_native_bytes / GiB_bytes,
+                    planned_native_bytes / GiB_bytes,
+                )
 
-    def _get_sleep_mode_allocator(self) -> CaMemAllocator:
+    def get_famem_kv_cache_block_fit(self, kv_cache_configs: list[KVCacheConfig]) -> dict[str, int]:
+        """Return this rank's largest KV block count that fits its bump arena."""
+        if self.rank < 0 or self.rank >= len(kv_cache_configs):
+            raise RuntimeError(f"Worker rank {self.rank} has no KV cache configuration.")
+        allocator = self._get_sleep_mode_allocator()
+        if not isinstance(allocator, FaMemAllocator):
+            raise RuntimeError("Famem KV cache calibration was requested for a non-Famem worker.")
+        fit = find_max_fitting_blocks(
+            kv_cache_configs[self.rank],
+            allocator.available_bytes,
+            self.model_runner.get_kv_cache_allocation_plan,
+            os.environ.get("PYTORCH_NPU_ALLOC_CONF", ""),
+        )
+        return fit.as_dict()
+
+    def _configured_famem(self):
+        config = get_famem_config(self.vllm_config)
+        return config if config.enabled else None
+
+    def _get_sleep_mode_allocator(self) -> CaMemAllocator | FaMemAllocator:
         allocator = getattr(self, "_sleep_mode_allocator", None)
         if allocator is not None:
             return allocator
         allocator = create_sleep_mode_allocator(self.vllm_config, self.device)
         self._sleep_mode_allocator = allocator
         return allocator
+
+    def get_famem_stats(self) -> dict[str, int | str | bool]:
+        """Return non-sensitive Famem diagnostics for validation and operations."""
+        allocator = getattr(self, "_sleep_mode_allocator", None)
+        if not isinstance(allocator, FaMemAllocator):
+            return {"enabled": False}
+        diagnostics = allocator.diagnostics()
+        free_bytes, total_bytes = torch.npu.mem_get_info()
+        diagnostics.update(
+            {
+                "npu_free_bytes": free_bytes,
+                "npu_total_bytes": total_bytes,
+                "npu_used_bytes": total_bytes - free_bytes,
+            }
+        )
+        return diagnostics
 
     def shutdown(self) -> None:
         allocator = getattr(self, "_sleep_mode_allocator", None)

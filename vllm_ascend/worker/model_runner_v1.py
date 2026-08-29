@@ -42,6 +42,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.base_loader import init_map, locate_splited_weights_on_layer
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
@@ -102,6 +103,12 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.device_allocator.kv_cache_plan import (
+    KV_CACHE_ADDRESS_ALIGNMENT_BYTES,
+    KVCacheAllocationPlan,
+    KVCacheAllocationRequest,
+)
+from vllm_ascend.device_allocator.multiproc_pipe_config import is_multiproc_pipe_enabled
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -165,6 +172,13 @@ SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
+
+
+@dataclass(frozen=True)
+class _KVCacheTensorAllocationPlan:
+    shared_by: tuple[str, ...]
+    requests: tuple[KVCacheAllocationRequest, ...]
+    is_attention: bool
 
 
 @contextmanager
@@ -2602,7 +2616,15 @@ class NPUModelRunner(GPUModelRunner):
                 enable_enpu=self.enable_enpu,
             )
 
-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        if is_multiproc_pipe_enabled(self.vllm_config):
+            init_map(self.model_config.get_num_layers(self.vllm_config.parallel_config))
+            locate_splited_weights_on_layer(self.model)
+
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        expected_allocation_plan: KVCacheAllocationPlan | None = None,
+    ) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
         Args:
@@ -2623,7 +2645,11 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.may_reinitialize_input_batch(kv_cache_config)
-        kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        tensor_allocation_plan = self._build_kv_cache_tensor_allocation_plan(kv_cache_config)
+        allocation_plan = self._flatten_kv_cache_allocation_plan(tensor_allocation_plan)
+        if expected_allocation_plan is not None and allocation_plan != expected_allocation_plan:
+            raise RuntimeError("KV cache allocation plan changed between Famem calibration and allocation.")
+        kv_caches = self.initialize_kv_cache_tensors(kv_cache_config, tensor_allocation_plan)
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (
@@ -2646,7 +2672,11 @@ class NPUModelRunner(GPUModelRunner):
         offset = (aligned_addr - data_ptr) // tensor.element_size()
         return tensor[int(offset) :]
 
-    def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+    def initialize_kv_cache_tensors(
+        self,
+        kv_cache_config: KVCacheConfig,
+        tensor_allocation_plan: tuple[_KVCacheTensorAllocationPlan, ...] | None = None,
+    ) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
 
@@ -2657,7 +2687,7 @@ class NPUModelRunner(GPUModelRunner):
             corresponding memory buffer for KV cache.
         """
         # Initialize the memory buffer for KV cache
-        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config, tensor_allocation_plan)
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
 
@@ -2700,146 +2730,149 @@ class NPUModelRunner(GPUModelRunner):
         head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
         return kv_cache_spec.head_size, head_size_v
 
-    def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
-        """
-        Initializes the KV cache buffer with the correct size. The buffer needs
-        to be reshaped to the desired shape before being used by the models.
-
-        NOTE: To support prefill disaggregation, we need to split kvcache tensor into
-        k_cache and v cache, and the addr of both are aligned by 2M
-
-        Args:
-            kv_cache_config: The KV cache config
-        Returns:
-            dict[str, torch.Tensor]: A map between layer names to their
-            corresponding memory buffer for KV cache.
-            dict[str, tuple(torch.Tensor, torch.Tensor)] A map between layer names
-            to their corresponding memory buffer for K cache and V cache.
-        """
-        # init kv cache tensors
-        kv_cache_raw_tensors: dict[str, torch.Tensor | torch.Tensor | None | None] = {}
-        # prefill disaggregation need the addr of cache tensor be aligned with 2M
-        alignment = 2 * 1024 * 1024
+    def _build_kv_cache_tensor_allocation_plan(
+        self, kv_cache_config: KVCacheConfig
+    ) -> tuple[_KVCacheTensorAllocationPlan, ...]:
+        """Build the exact logical requests used to allocate KV cache tensors."""
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
-        # If some tensors are shared by linear layers and attention layers,
-        # the same tensor format must be maintained even if some layers
-        # have only linear or attention layers, for example, the mtp layer.
-        self.hybrid_with_attn_and_mamba = False
+        alignment = (
+            KV_CACHE_ADDRESS_ALIGNMENT_BYTES if self.vllm_config.kv_transfer_config is not None else 0
+        )
+        plans: list[_KVCacheTensorAllocationPlan] = []
+        allocated_layer_names: set[str] = set()
+        hybrid_with_attn_and_mamba = False
+
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            use_mamba, use_attn = False, False
+            use_mamba = any(
+                isinstance(layer_kv_cache_spec[layer_name], MambaSpec)
+                for layer_name in kv_cache_tensor.shared_by
+            )
+            use_attn = any(
+                isinstance(layer_kv_cache_spec[layer_name], AttentionSpec)
+                for layer_name in kv_cache_tensor.shared_by
+            )
+            hybrid_with_attn_and_mamba = hybrid_with_attn_and_mamba or (use_mamba and use_attn)
+
             for layer_name in kv_cache_tensor.shared_by:
-                if isinstance(layer_kv_cache_spec[layer_name], MambaSpec):
-                    use_mamba = True
-                if isinstance(layer_kv_cache_spec[layer_name], AttentionSpec):
-                    use_attn = True
-            self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
-            for idx in range(len(kv_cache_tensor.shared_by)):
-                layer_name = kv_cache_tensor.shared_by[idx]
                 if (
-                    "linear_attn" in layer_name or self.hybrid_with_attn_and_mamba
-                ) and layer_name not in kv_cache_raw_tensors:
-                    # for mamba linear attention or attn-linear hybrid
-                    if self.vllm_config.kv_transfer_config is None:
-                        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
-                    else:
-                        cache_size_aligned = kv_cache_tensor.size + alignment
-                        tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
-                        tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
+                    "linear_attn" in layer_name or hybrid_with_attn_and_mamba
+                ) and layer_name not in allocated_layer_names:
+                    plans.append(
+                        _KVCacheTensorAllocationPlan(
+                            shared_by=tuple(kv_cache_tensor.shared_by),
+                            requests=(
+                                KVCacheAllocationRequest(
+                                    payload_bytes=kv_cache_tensor.size,
+                                    alignment_bytes=alignment,
+                                ),
+                            ),
+                            is_attention=False,
+                        )
+                    )
+                    allocated_layer_names.update(kv_cache_tensor.shared_by)
+                    break
 
-                    for layer_name_inner in kv_cache_tensor.shared_by:
-                        # shared the kvcache for all shared layers
-                        kv_cache_raw_tensors[layer_name_inner] = tensor
-                elif "attn" in layer_name and layer_name not in kv_cache_raw_tensors and not use_mamba:
-                    # NOTE: We need to init k cache tensor (nope cache tensor in mla) and
-                    # v cache tensor (rope cache tensor in mla) separately to support prefill disaggregation,
-                    # as it only support the 0-dim of kv_cache is `num_blocks`.
-                    # For deepseek mla, we need to spilt cache tensor accrodding to the nope head dim
-                    # and rope head dim.
-                    current_kv_cache_spec = layer_kv_cache_spec[layer_name]
-                    assert isinstance(current_kv_cache_spec, AttentionSpec)
-
-                    if self.use_sparse:
-                        # for deepseek v3.2, we split the kv cache according to the corresponding ratio
-                        kv_cache_spec = layer_kv_cache_spec[layer_name]
-                        sparse_kv_cache_ratio = kv_cache_spec.sparse_kv_cache_ratio
-                        k_tensor_split_factor = sparse_kv_cache_ratio[0]
-                        v_tensor_split_factor = sparse_kv_cache_ratio[1]
-                        dsa_k_tensor_split_factor = sparse_kv_cache_ratio[2]
-                        dsa_k_scale_tensor_split_factor = sparse_kv_cache_ratio[3]
-                    else:
-                        k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
-                        assert k_dim > 0 and v_dim > 0
-                        kv_head_dim_list = [
-                            k_dim,
-                            v_dim,
-                        ]
-                        if self.is_kv_consumer and enable_fa_quant(self.vllm_config):
-                            k_tensor_split_factor, v_tensor_split_factor = (
-                                self.vllm_config.quant_config.get_kv_quant_split_factor(layer_name, kv_head_dim_list)
-                            )
-                        else:
-                            k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
-
-                    k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
-                    v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
-                    dsa_k_tensor_size = None
-                    dsa_k_scale_tensor_size = None
-                    #### for deepseek sparse attention
-                    if self.use_sparse:
-                        dsa_k_tensor_size = int(kv_cache_tensor.size // dsa_k_tensor_split_factor)
-                    if self.use_sparse_c8_indexer:
-                        dsa_k_scale_tensor_size = int(kv_cache_tensor.size // dsa_k_scale_tensor_split_factor)
-
-                    # for other attentions, e.g., self_attn, sliding window attn
-                    if self.vllm_config.kv_transfer_config is None:
-                        k_tensor = torch.zeros(k_tensor_size, dtype=torch.int8, device=self.device)
-                        v_tensor = torch.zeros(v_tensor_size, dtype=torch.int8, device=self.device)
-                        #### for deepseek sparse attention
-                        if dsa_k_tensor_size is not None:
-                            dsa_k_tensor = torch.zeros(dsa_k_tensor_size, dtype=torch.int8, device=self.device)
-                        if dsa_k_scale_tensor_size is not None:
-                            dsa_k_scale_tensor = torch.zeros(
-                                dsa_k_scale_tensor_size, dtype=torch.int8, device=self.device
-                            )
-                    else:
-                        k_tensor = torch.zeros(k_tensor_size + alignment, dtype=torch.int8, device=self.device)
-                        v_tensor = torch.zeros(v_tensor_size + alignment, dtype=torch.int8, device=self.device)
-                        k_tensor = self._align_memory(k_tensor, alignment)[:k_tensor_size]
-                        v_tensor = self._align_memory(v_tensor, alignment)[:v_tensor_size]
-                        #### for deepseek sparse attention
-                        if dsa_k_tensor_size is not None:
-                            dsa_k_tensor = torch.zeros(
-                                dsa_k_tensor_size + alignment, dtype=torch.int8, device=self.device
-                            )
-                            dsa_k_tensor = self._align_memory(dsa_k_tensor, alignment)[:dsa_k_tensor_size]
-                        if dsa_k_scale_tensor_size is not None:
-                            dsa_k_scale_tensor = torch.zeros(
-                                dsa_k_scale_tensor_size + alignment, dtype=torch.int8, device=self.device
-                            )
-                            dsa_k_scale_tensor = self._align_memory(
-                                dsa_k_scale_tensor, alignment
-                            )[:dsa_k_scale_tensor_size]
-
-                    for layer_name_inner in kv_cache_tensor.shared_by:
-                        # shared the attn kvcache for all shared layers
-                        if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            if self.use_sparse:
-                                if self.use_sparse_c8_indexer:
-                                    kv_cache_raw_tensors[layer_name_inner] = (
-                                        k_tensor, v_tensor, dsa_k_tensor, dsa_k_scale_tensor
-                                    )
-                                else:
-                                    kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor, dsa_k_tensor)
-                            else:
-                                kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
-        layer_names = set()
-        for group in kv_cache_config.kv_cache_groups:
-            for layer_name in group.layer_names:
-                if layer_name in self.runner_only_attn_layers:
+                if "attn" not in layer_name or layer_name in allocated_layer_names or use_mamba:
                     continue
-                layer_names.add(layer_name)
-        assert layer_names == set(kv_cache_raw_tensors.keys()), "Some layers are not correctly initialized"
 
+                current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+                assert isinstance(current_kv_cache_spec, AttentionSpec)
+                if self.use_sparse:
+                    sparse_kv_cache_ratio = current_kv_cache_spec.sparse_kv_cache_ratio
+                    split_factors = [
+                        sparse_kv_cache_ratio[0],
+                        sparse_kv_cache_ratio[1],
+                        sparse_kv_cache_ratio[2],
+                    ]
+                    if self.use_sparse_c8_indexer:
+                        split_factors.append(sparse_kv_cache_ratio[3])
+                else:
+                    k_dim, v_dim = self._get_attention_kv_cache_dims(layer_name, current_kv_cache_spec)
+                    assert k_dim > 0 and v_dim > 0
+                    kv_head_dims = [k_dim, v_dim]
+                    if self.is_kv_consumer and enable_fa_quant(self.vllm_config):
+                        split_factors = list(
+                            self.vllm_config.quant_config.get_kv_quant_split_factor(layer_name, kv_head_dims)
+                        )
+                    else:
+                        split_factors = list(calc_split_factor(kv_head_dims))
+
+                requests = tuple(
+                    KVCacheAllocationRequest(
+                        payload_bytes=int(kv_cache_tensor.size // split_factor),
+                        alignment_bytes=alignment,
+                    )
+                    for split_factor in split_factors
+                )
+                shared_by = tuple(
+                    inner_name
+                    for inner_name in kv_cache_tensor.shared_by
+                    if "attn" in inner_name and "linear_attn" not in inner_name
+                )
+                plans.append(
+                    _KVCacheTensorAllocationPlan(
+                        shared_by=shared_by,
+                        requests=requests,
+                        is_attention=True,
+                    )
+                )
+                allocated_layer_names.update(shared_by)
+                break
+
+        expected_layer_names = {
+            layer_name
+            for group in kv_cache_config.kv_cache_groups
+            for layer_name in group.layer_names
+            if layer_name not in self.runner_only_attn_layers
+        }
+        if expected_layer_names != allocated_layer_names:
+            missing = sorted(expected_layer_names - allocated_layer_names)
+            unexpected = sorted(allocated_layer_names - expected_layer_names)
+            raise AssertionError(
+                "Some KV cache layers are not correctly planned: "
+                f"missing={missing}, unexpected={unexpected}."
+            )
+        self.hybrid_with_attn_and_mamba = hybrid_with_attn_and_mamba
+        return tuple(plans)
+
+    @staticmethod
+    def _flatten_kv_cache_allocation_plan(
+        tensor_allocation_plan: tuple[_KVCacheTensorAllocationPlan, ...],
+    ) -> KVCacheAllocationPlan:
+        return KVCacheAllocationPlan(
+            tuple(request for tensor_plan in tensor_allocation_plan for request in tensor_plan.requests)
+        )
+
+    def get_kv_cache_allocation_plan(self, kv_cache_config: KVCacheConfig) -> KVCacheAllocationPlan:
+        """Return the request plan shared by Famem sizing and allocation."""
+        return self._flatten_kv_cache_allocation_plan(self._build_kv_cache_tensor_allocation_plan(kv_cache_config))
+
+    def _allocate_kv_cache_request(self, request: KVCacheAllocationRequest) -> torch.Tensor:
+        tensor = torch.zeros(request.requested_bytes, dtype=torch.int8, device=self.device)
+        if request.alignment_bytes:
+            tensor = self._align_memory(tensor, request.alignment_bytes)[: request.payload_bytes]
+        return tensor
+
+    def _allocate_kv_cache_tensors(
+        self,
+        kv_cache_config: KVCacheConfig,
+        tensor_allocation_plan: tuple[_KVCacheTensorAllocationPlan, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Allocate raw KV buffers from the same plan used for Famem sizing."""
+        if tensor_allocation_plan is None:
+            tensor_allocation_plan = self._build_kv_cache_tensor_allocation_plan(kv_cache_config)
+
+        kv_cache_raw_tensors: dict[str, Any] = {}
+        for tensor_plan in tensor_allocation_plan:
+            tensors = tuple(self._allocate_kv_cache_request(request) for request in tensor_plan.requests)
+            value: torch.Tensor | tuple[torch.Tensor, ...]
+            if tensor_plan.is_attention:
+                value = tensors
+            else:
+                assert len(tensors) == 1
+                value = tensors[0]
+            for layer_name in tensor_plan.shared_by:
+                kv_cache_raw_tensors[layer_name] = value
         return kv_cache_raw_tensors
 
     def _reshape_kv_cache_tensors(

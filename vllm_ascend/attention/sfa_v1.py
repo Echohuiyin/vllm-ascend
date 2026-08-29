@@ -363,6 +363,10 @@ class AscendSFAImpl(MLAAttentionImpl):
     q_hadamard: torch.Tensor | None = None
     k_hadamard: torch.Tensor | None = None
 
+    def get_multiproc_pipe_persistent_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return shared inference constants that the Copier must restore."""
+        return tuple(tensor for tensor in (AscendSFAImpl.q_hadamard, AscendSFAImpl.k_hadamard) if tensor is not None)
+
     def __init__(
         self,
         num_heads: int,
